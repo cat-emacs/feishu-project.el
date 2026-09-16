@@ -46,14 +46,14 @@ list of normalized item alists and own their own pagination.
 
 The MCP backend uses the official `https://project.feishu.cn/mcp_server/v1`
 server. It requires Emacs 30.1 and the temporary
-[`cat-emacs/mcp.el`](https://github.com/cat-emacs/mcp.el) OAuth branch at
-revision `0f18e48fd47793e326f25d70ca0fc79fce2f69a6` or newer:
+[`cat-emacs/mcp.el`](https://github.com/cat-emacs/mcp.el) OAuth branch
+`feat/oauth-client`:
 
 ```elisp
 (use-package mcp
   :if EMACS30+
   :vc (:url "https://github.com/cat-emacs/mcp.el"
-       :rev "0f18e48fd47793e326f25d70ca0fc79fce2f69a6"))
+       :branch "feat/oauth-client"))
 
 (setq feishu-project-backend 'mcp)
 ```
