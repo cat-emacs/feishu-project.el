@@ -51,6 +51,30 @@
   "Preferred number of rows requested by a backend."
   :type 'integer)
 
+(defcustom feishu-project-query-history nil
+  "Recently used Feishu Project MQL strings."
+  :type '(repeat string)
+  :group 'feishu-project)
+
+(defcustom feishu-project-query-history-length 30
+  "Maximum number of remembered MQL queries."
+  :type 'integer
+  :group 'feishu-project)
+
+(defun feishu-project--remember-query (mql)
+  "Remember MQL without Custom persistence."
+  (setq feishu-project-query-history
+        (seq-take (cons mql (delete mql feishu-project-query-history))
+                  feishu-project-query-history-length)))
+
+(defcustom feishu-project-project-aliases nil
+  "Named Feishu Project spaces as (NAME . PROJECT-KEY) pairs."
+  :type '(alist :key-type string :value-type string))
+
+(defcustom feishu-project-detail-reuse-buffer nil
+  "When non-nil, reuse one detail buffer for all work items."
+  :type 'boolean)
+
 (defcustom feishu-project-saved-mql nil
   "Named MQL queries offered by `feishu-project-mql'."
   :type '(alist :key-type string :value-type string))
@@ -95,12 +119,21 @@ with the originating list buffer and generation.  Results contain :items or
     (or (plist-get (feishu-project--backend name) key)
         (user-error "Backend %S does not support %s" name key))))
 
+(defun feishu-project--action (action payload success failure &optional backend)
+  "Run backend ACTION with callback SUCCESS or explicit capability FAILURE."
+  (let* ((backend (or backend feishu-project--backend-name feishu-project-backend))
+         (function (plist-get (feishu-project--backend backend) :action)))
+    (if function
+        (funcall function action payload success failure)
+      (funcall failure (format "Feishu Project backend %s does not support %s; select MCP"
+                               backend action)))))
+
+
 (defun feishu-project--get (key object)
   "Return KEY from plist or alist OBJECT, accepting symbol or string keys."
   (or (and (listp object) (plist-get object key))
       (and (listp object) (alist-get key object))
-      (and (symbolp key)
-           (listp object)
+      (and (symbolp key) (listp object)
            (alist-get (symbol-name key) object nil nil #'equal))))
 
 (defvar-local feishu-project--items nil)
@@ -114,6 +147,13 @@ with the originating list buffer and generation.  Results contain :items or
 (defvar-local feishu-project--total nil)
 (defvar-local feishu-project--loading nil)
 (defvar-local feishu-project--generation 0)
+(defvar-local feishu-project--filters nil)
+(defvar-local feishu-project--marked nil)
+(defvar-local feishu-project--active-columns nil)
+(defvar-local feishu-project--detail-identity nil)
+(defvar-local feishu-project--detail-generation 0)
+(defvar-local feishu-project--detail-sections nil)
+(defvar-local feishu-project--detail-section-data nil)
 
 (defun feishu-project--host ()
   "Return the configured host without a trailing slash."
@@ -192,13 +232,53 @@ Arbitrary MQL results without a type cannot form a Feishu detail URL."
          (with-current-buffer buffer
            (= generation feishu-project--generation)))))
 
+(defun feishu-project--row-identity (item &optional backend project)
+  "Return stable identity for ITEM in BACKEND and PROJECT."
+  (list (or backend feishu-project--backend-name feishu-project-backend)
+        (or project (feishu-project--item-project item))
+        (feishu-project--item-type-key item)
+        (feishu-project--item-id item)))
+
+(defun feishu-project--column-normalize (column)
+  "Normalize legacy COLUMN tuple to a declarative plist."
+  (if (keywordp (car column)) column
+    (list :title (nth 0 column) :width (nth 1 column) :getter (nth 2 column))))
+
+(defun feishu-project--columns ()
+  "Return active normalized columns."
+  (mapcar #'feishu-project--column-normalize
+          (or feishu-project--active-columns feishu-project-list-columns)))
+
+(defun feishu-project-toggle-mark (&optional item)
+  "Toggle a mark on ITEM or the item at point."
+  (interactive)
+  (let ((item (or item (feishu-project-item-at-point))))
+    (unless feishu-project--marked
+      (setq feishu-project--marked (make-hash-table :test #'equal)))
+    (let ((key (feishu-project--row-identity item)))
+      (if (gethash key feishu-project--marked) (remhash key feishu-project--marked)
+        (puthash key item feishu-project--marked)))
+    (feishu-project--render-list)))
+
+(defun feishu-project-unmark-all ()
+  "Clear all marks." (interactive)
+  (when feishu-project--marked (clrhash feishu-project--marked))
+  (feishu-project--render-list))
+
+(defun feishu-project-marked-items ()
+  "Return marked items, or all visible items when none are marked."
+  (if (and feishu-project--marked (> (hash-table-count feishu-project--marked) 0))
+      (let (items) (maphash (lambda (_ item) (push item items)) feishu-project--marked) (nreverse items))
+    feishu-project--items))
+
 (defun feishu-project--entry (item)
   "Create a tabulated-list entry for ITEM."
-  (list item
-        (vconcat
-         (mapcar (lambda (column)
-                   (format "%s" (funcall (nth 2 column) item)))
-                 feishu-project-list-columns))))
+  (let ((marked (and feishu-project--marked
+                     (gethash (feishu-project--row-identity item) feishu-project--marked))))
+    (list item (vconcat (mapcar (lambda (column)
+                                  (let ((value (format "%s" (funcall (plist-get column :getter) item))))
+                                    (if marked (propertize value 'face 'warning) value)))
+                                (feishu-project--columns))))))
 
 (defun feishu-project--render-list ()
   "Render the committed items in the current list buffer."
@@ -270,13 +350,15 @@ Page state is committed only by a successful callback."
     (user-error "Feishu Project request is already in progress"))
   (let* ((buffer (current-buffer))
          (generation (cl-incf feishu-project--generation))
-         (context (list :buffer buffer :generation generation)))
+         (context (list :buffer buffer :generation generation
+                        :filters (copy-tree feishu-project--filters))))
     (setq feishu-project--loading t)
     (feishu-project--render-loading)
     (feishu-project--invoke-list-backend context page-token history)))
 
-(defun feishu-project--display (project-key type-spec kind query)
-  "Display KIND QUERY in PROJECT-KEY using TYPE-SPEC."
+(defun feishu-project--display (project-key type-spec kind query &optional filters)
+  "Display KIND QUERY in PROJECT-KEY using TYPE-SPEC and FILTERS."
+  (when (eq kind 'mql) (feishu-project--remember-query query))
   (let ((buffer (get-buffer-create "*Feishu Project*")))
     (with-current-buffer buffer
       (feishu-project-list-mode)
@@ -288,7 +370,8 @@ Page state is committed only by a successful callback."
             feishu-project--current-page-token nil
             feishu-project--next-page-token nil
             feishu-project--page-history nil
-            feishu-project--total nil)
+            feishu-project--total nil
+            feishu-project--filters filters)
       (feishu-project--request-page nil nil))
     (pop-to-buffer buffer)))
 
@@ -317,97 +400,78 @@ Page state is committed only by a successful callback."
     (message "Copied %s" id)))
 
 (defun feishu-project--insert-value (value)
-  "Insert VALUE in a readable form at point."
-  (cond
-   ((null value) (insert "-"))
-   ((stringp value) (insert value))
-   ((numberp value) (insert (number-to-string value)))
-   ((eq value t) (insert "true"))
-   (t (pp value (current-buffer)))))
+  "Insert VALUE in readable form without raw Lisp dumps."
+  (cond ((null value) (insert "-")) ((stringp value) (insert value))
+        ((numberp value) (insert (number-to-string value)))
+        ((listp value) (insert (string-join (delq nil (mapcar (lambda (x) (and (consp x) (format "%s" (cdr x)))) value)) ", ")))
+        (t (insert (format "%s" value)))))
 
 (defun feishu-project--render-detail (item)
-  "Render normalized ITEM into the current detail buffer."
+  "Render ITEM and structured sections in the current detail buffer."
   (let ((inhibit-read-only t))
     (erase-buffer)
-    (insert (propertize (feishu-project--item-name item)
-                        'face '(:height 1.35 :weight bold))
-            "\n\n")
-    (dolist (row `(("ID" . ,(feishu-project--item-id item))
-                   ("Type" . ,(feishu-project--item-type item))
-                   ("Status" . ,(feishu-project--item-status item))
-                   ("Project" . ,(feishu-project--item-project item))
-                   ("Created" . ,(feishu-project--get 'created_at item))
-                   ("Updated" . ,(feishu-project--item-updated item))))
-      (insert (propertize (format "%-12s" (car row)) 'face 'bold))
-      (feishu-project--insert-value (cdr row))
-      (insert "\n"))
     (when (feishu-project--get 'detail-truncated item)
-      (insert "\nDetail fields are truncated; fetch additional pages in Feishu Project.\n"))
+      (insert "Warning: detail fields are truncated; refresh cannot provide omitted fields.\n\n"))
+    (insert (propertize (feishu-project--item-name item) 'face '(:height 1.35 :weight bold)) "\n\n")
+    (dolist (row `(("ID" . ,(feishu-project--item-id item)) ("Type" . ,(feishu-project--item-type item))
+                   ("Status" . ,(feishu-project--item-status item)) ("Project" . ,(feishu-project--item-project item))
+                   ("Updated" . ,(feishu-project--item-updated item))))
+      (insert (propertize (format "%-12s" (car row)) 'face 'bold)) (feishu-project--insert-value (cdr row)) (insert "\n"))
+    (insert "\nFields\n------\n")
     (dolist (field (feishu-project--get 'fields item))
-      (insert "\n"
-              (propertize (format "%s\n"
-                                  (or (feishu-project--get 'field_alias field)
-                                      (feishu-project--get 'field_key field)))
-                          'face 'bold)
-              "  ")
-      (feishu-project--insert-value (feishu-project--get 'field_value field))
-      (unless (bolp)
-        (insert "\n")))
+      (insert (propertize (format "%s: " (or (feishu-project--get 'field_alias field) (feishu-project--get 'field_key field))) 'face 'bold))
+      (feishu-project--insert-value (feishu-project--get 'field_value field)) (insert "\n"))
+    (dolist (section feishu-project--detail-sections)
+      (insert "\n" (propertize (format "%s\n" (car section)) 'face 'bold) (make-string (length (car section)) ?-) "\n")
+      (dolist (line (cdr section)) (insert (format "%s\n" line))))
     (goto-char (point-min))))
 
-(defun feishu-project--finish-detail (result context detail-buffer)
-  "Finish detail RESULT for CONTEXT and live DETAIL-BUFFER."
-  (when (feishu-project--request-current-p context)
-    (with-current-buffer (plist-get context :buffer)
-      (setq feishu-project--loading nil))
-    (when (buffer-live-p detail-buffer)
-      (let ((item (plist-get result :item)))
-        (with-current-buffer detail-buffer
-          (setq-local feishu-project--items (list item))
-          (feishu-project--render-detail item))))))
+(defun feishu-project--detail-buffer-name (item backend)
+  "Return collision-resistant detail buffer name for ITEM and BACKEND."
+  (if feishu-project-detail-reuse-buffer "*Feishu Project Detail*"
+    (format "*Feishu Project %s:%s:%s:%s*" backend (feishu-project--item-project item)
+            (feishu-project--item-type-key item) (feishu-project--item-id item))))
 
-(defun feishu-project--fail-detail (error context detail-buffer)
-  "Finish detail ERROR for CONTEXT and live DETAIL-BUFFER."
-  (when (feishu-project--request-current-p context)
-    (with-current-buffer (plist-get context :buffer)
-      (setq feishu-project--loading nil))
-    (when (buffer-live-p detail-buffer)
-      (with-current-buffer detail-buffer
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert (format "Feishu Project: %s\n" error)))))))
+(defun feishu-project--detail-current-p (buffer generation identity)
+  "Return non-nil when BUFFER still expects GENERATION and IDENTITY."
+  (and (buffer-live-p buffer) (with-current-buffer buffer
+                                (and (= generation feishu-project--detail-generation)
+                                     (equal identity feishu-project--detail-identity)))))
+
+(defun feishu-project--finish-detail (result _context buffer generation identity)
+  "Render RESULT only when BUFFER still expects this detail request."
+  (when (feishu-project--detail-current-p buffer generation identity)
+    (let ((item (plist-get result :item)))
+      (with-current-buffer buffer
+        (when (equal identity (feishu-project--row-identity item feishu-project--backend-name))
+          (setq-local feishu-project--items (list item)) (feishu-project--render-detail item))))))
+
+(defun feishu-project--fail-detail (error _context buffer generation identity)
+  "Render ERROR only when BUFFER still expects this detail request."
+  (when (feishu-project--detail-current-p buffer generation identity)
+    (with-current-buffer buffer (let ((inhibit-read-only t)) (erase-buffer) (insert (format "Feishu Project: %s\n" error))))))
+
+(defun feishu-project--request-detail (item backend buffer &optional context)
+  "Fetch ITEM through pinned BACKEND into BUFFER with stale protection."
+  (let* ((identity (feishu-project--row-identity item backend))
+         (context (or context (list :buffer buffer :generation 0))) generation)
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'feishu-project-detail-mode) (feishu-project-detail-mode))
+      (setq-local feishu-project--backend-name backend feishu-project--detail-identity identity)
+      (setq generation (cl-incf feishu-project--detail-generation))
+      (let ((inhibit-read-only t)) (erase-buffer) (insert "Loading Feishu Project details…\n")))
+    (funcall (feishu-project--backend-function :detail backend) item context
+             (lambda (result) (feishu-project--finish-detail result context buffer generation identity))
+             (lambda (error) (feishu-project--fail-detail error context buffer generation identity)))))
 
 (defun feishu-project-show ()
   "Show details for the work item at point asynchronously."
   (interactive)
-  (when feishu-project--loading
-    (user-error "Feishu Project request is already in progress"))
-  (let* ((list-buffer (current-buffer))
-         (summary (feishu-project-item-at-point))
-         (generation (cl-incf feishu-project--generation))
-         (context (list :buffer list-buffer :generation generation))
-         (detail-function (feishu-project--backend-function :detail))
-         (detail-buffer
-          (get-buffer-create
-           (format "*Feishu Project %s*" (feishu-project--item-id summary)))))
-    (setq feishu-project--loading t)
-    (with-current-buffer detail-buffer
-      (feishu-project-detail-mode)
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert "Loading Feishu Project details…\n")))
-    (pop-to-buffer detail-buffer)
-    (condition-case err
-        (funcall detail-function
-                 summary
-                 context
-                 (lambda (result)
-                   (feishu-project--finish-detail result context detail-buffer))
-                 (lambda (error)
-                   (feishu-project--fail-detail error context detail-buffer)))
-      (error
-       (feishu-project--fail-detail (error-message-string err)
-                                    context detail-buffer)))))
+  (let* ((item (feishu-project-item-at-point)) (backend feishu-project--backend-name)
+         (buffer (get-buffer-create (feishu-project--detail-buffer-name item backend))))
+    (pop-to-buffer buffer)
+    (feishu-project--request-detail item backend buffer
+                                    (list :buffer (current-buffer) :generation feishu-project--generation))))
 
 (defun feishu-project-detail-open ()
   "Open the detail buffer's work item in a browser."
@@ -490,12 +554,21 @@ Page state is committed only by a successful callback."
    (car feishu-project--page-history)
    (cdr feishu-project--page-history)))
 
+(autoload 'feishu-project-dispatch "feishu-project-workbench")
+(autoload 'feishu-project-detail-dispatch "feishu-project-workbench")
+(autoload 'feishu-project-detail-refresh "feishu-project-workbench")
+(autoload 'feishu-project-toggle-mark "feishu-project-workbench")
+(autoload 'feishu-project-unmark-all "feishu-project-workbench")
+
 (defvar-keymap feishu-project-list-mode-map
   :parent tabulated-list-mode-map
   "RET" #'feishu-project-show
   "o" #'feishu-project-open
   "w" #'feishu-project-copy-id
   "W" #'feishu-project-copy-url
+  "m" #'feishu-project-toggle-mark
+  "u" #'feishu-project-unmark-all
+  "?" #'feishu-project-dispatch
   "g" #'revert-buffer
   "n" #'feishu-project-next-page
   "p" #'feishu-project-previous-page
@@ -516,6 +589,8 @@ Page state is committed only by a successful callback."
 
 (defvar-keymap feishu-project-detail-mode-map
   :parent special-mode-map
+  "g" #'feishu-project-detail-refresh
+  "?" #'feishu-project-detail-dispatch
   "o" #'feishu-project-detail-open
   "W" #'feishu-project-detail-copy-url
   "q" #'quit-window)

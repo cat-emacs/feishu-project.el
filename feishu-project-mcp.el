@@ -57,7 +57,7 @@
                          :object-type 'alist
                          :array-type 'list
                          :null-object nil
-                         :false-object :json-false)
+                         :false-object nil)
     (json-parse-error
      (error "Feishu MCP returned malformed JSON: %s"
             (error-message-string err)))))
@@ -66,6 +66,7 @@
   "Extract and decode the first text content item in MCP RESULT."
   (let ((tool-error (or (plist-get result :isError)
                         (plist-get result :is-error))))
+    ;; mcp.el may preserve its own JSON false sentinel in the outer envelope.
     (when (and tool-error (not (eq tool-error :json-false)))
       (error "Feishu MCP tool error: %s" result)))
   (let* ((content (or (plist-get result :content)
@@ -328,32 +329,69 @@ before reconnecting."
   "Return non-nil when list CONTEXT still belongs to the active request."
   (feishu-project--request-current-p context))
 
+(defun feishu-project-mcp--mql-string (value)
+  "Return VALUE as an escaped MQL string literal."
+  (concat "'" (replace-regexp-in-string "['\\\\]"
+                                             (lambda (match) (concat "\\\\" match))
+                                             (format "%s" value) t t) "'"))
+
+(defun feishu-project-mcp--filter-predicates (configs filters)
+  "Validate FILTERS against CONFIGS and return exact MQL predicates."
+  (let ((fields '((:status . "work_item_status") (:assignee . "assignee")
+                  (:creator . "creator"))) predicates)
+    (dolist (entry fields)
+      (let ((value (plist-get filters (car entry))) (field (cdr entry)))
+        (when value
+          (unless (cl-some (lambda (config) (equal field (alist-get 'field_key config))) configs)
+            (user-error "Filter field %s is unavailable for this work item type" field))
+          (push (format "`%s` = %s" field (feishu-project-mcp--mql-string value)) predicates))))
+    (nreverse predicates)))
+
+(defun feishu-project-mcp--mql-for-type (project type filters)
+  "Build minimal MQL for PROJECT TYPE with validated FILTERS."
+  (let ((base (format "SELECT `work_item_id`, `name`, `work_item_status`, `updated_at` FROM `%s`.`%s`"
+                      project (plist-get type :key))))
+    (if filters
+        (concat base " WHERE " (string-join filters " AND ")
+                (format " LIMIT %d" feishu-project-page-size))
+      (concat base (format " LIMIT %d" feishu-project-page-size)))))
+
 (defun feishu-project-mcp--select-type (types project name context success failure)
   "Select a type in CONTEXT's original list buffer, then run minimal MQL."
   (when (feishu-project-mcp--context-active-p context)
     (let ((buffer (plist-get context :buffer)))
       (with-current-buffer buffer
-        (let* ((names (mapcar (lambda (type) (plist-get type :name)) types))
-               (choice (completing-read "Work item type: " names nil t))
-               (type (cl-find choice types
-                              :key (lambda (value) (plist-get value :name))
-                              :test #'equal))
-               (mql (format
-                     "SELECT `work_item_id`, `name`, `work_item_status`, `updated_at` FROM `%s`.`%s` LIMIT %d"
-                     project (plist-get type :key) feishu-project-page-size)))
-          (unless type
-            (funcall failure "No Feishu Project work item type was selected"))
-          (when name
-            (message "MCP list ignores name filtering; use MQL for schema-specific filtering"))
+        (let* ((choices (delete-dups (append (mapcar (lambda (type) (plist-get type :name)) types)
+                                             (mapcar (lambda (type) (plist-get type :key)) types))))
+               (filter-type (plist-get (plist-get context :filters) :type))
+               (choice (or filter-type (completing-read "Work item type: " choices nil t)))
+               (type (cl-find-if (lambda (value)
+                                   (or (equal choice (plist-get value :name))
+                                       (equal choice (plist-get value :key)))) types))
+               (filters (plist-get context :filters)))
+          (unless type (funcall failure "No Feishu Project work item type was selected"))
+          (when name (message "MCP list ignores name filtering; use MQL for schema-specific filtering"))
           (when type
-            (feishu-project-mcp--call
-             "search_by_mql"
-             (list :project_key project :mql mql)
-             (lambda (payload)
-               (funcall success
-                        (feishu-project-mcp--mql-result
-                         payload project type mql)))
-             failure)))))))
+            (let ((run-query
+                   (lambda (predicates)
+                     (let ((mql (feishu-project-mcp--mql-for-type project type predicates)))
+                       (feishu-project-mcp--call
+                        "search_by_mql" (list :project_key project :mql mql)
+                        (lambda (payload)
+                          (funcall success (feishu-project-mcp--mql-result payload project type mql)))
+                        failure)))))
+              (if (seq-some (lambda (key) (plist-get filters key)) '(:status :assignee :creator))
+                  (feishu-project-mcp--call
+                   "list_workitem_field_config"
+                   (list :project_key project :work_item_type (plist-get type :key))
+                   (lambda (payload)
+                     (condition-case err
+                         (funcall run-query
+                                  (feishu-project-mcp--filter-predicates
+                                   (or (alist-get 'list payload) (alist-get 'fields payload) '()) filters))
+                       (error (funcall failure (error-message-string err)))))
+                   failure)
+                (funcall run-query nil)))))))))
 
 (defun feishu-project-mcp--list (project _types name continuation context
                                          success failure)
@@ -381,11 +419,33 @@ before reconnecting."
      (funcall success (feishu-project-mcp--detail-result payload)))
    failure))
 
+(defun feishu-project-mcp--action-tool (action)
+  "Return verified MCP tool name for ACTION."
+  (pcase action
+    ('find "get_workitem_brief") ('field-schema "list_workitem_field_config")
+    ('field-meta "get_workitem_field_meta") ('update-field "update_field")
+    ('transition-states "get_transitable_states")
+    ('transition-required "get_transition_required") ('transition "transition_state")
+    ('create "create_workitem") ('comments "list_workitem_comments")
+    ('comment-save "add_comment") ('related "list_related_workitem")
+    ('history "get_workitem_op_record") ('upload-metadata "upload_file")
+    ('download-metadata "get_download_url") ('advanced-node-subtask "update_node_subtask")
+    ('project "search_project_info") (_ nil)))
+
+(defun feishu-project-mcp--action (action payload success failure)
+  "Run verified MCP ACTION with PAYLOAD."
+  (if-let* ((tool (feishu-project-mcp--action-tool action)))
+      (feishu-project-mcp--call tool payload
+       (lambda (data) (funcall success (if (eq action 'find) (feishu-project-mcp--detail-result data)
+                                         (list :action action :data data)))) failure)
+    (funcall failure (format "Unsupported Feishu MCP action: %s" action))))
+
 (feishu-project-register-backend
  'mcp
  (list :list #'feishu-project-mcp--list
        :mql #'feishu-project-mcp--mql
        :detail #'feishu-project-mcp--detail
+       :action #'feishu-project-mcp--action
        :types #'feishu-project-mcp--enabled-types))
 
 (provide 'feishu-project-mcp)

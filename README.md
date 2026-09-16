@@ -1,8 +1,9 @@
 # feishu-project.el
 
 Browse [Feishu Project](https://project.feishu.cn/) work items from Emacs.
-`feishu-project.el` has two interchangeable, read-only backends: the original
-plugin-token OpenAPI backend and an optional user-OAuth MCP backend.  The
+`feishu-project.el` has two interchangeable read backends: the original
+plugin-token OpenAPI backend and an optional user-OAuth MCP backend.  MCP also
+provides the explicitly confirmed workbench write actions documented below. The
 default is `openapi`, so upgrading does not start Node, open a browser, or
 change existing credentials.
 
@@ -73,6 +74,39 @@ fields; if the server says more field pages exist, the detail buffer explicitly
 marks the result truncated rather than claiming completeness.  Arbitrary MQL
 may omit a type key, in which case browser/detail URLs are unavailable.
 
+## Workbench commands
+
+With the MCP backend, the common callback-first UI also provides project aliases,
+query history and saved descriptors, schema-aware filters, selectable columns,
+marks, CSV/TSV/Org/Markdown/JSON export, and stale-safe detail sections.
+`M-x feishu-project-find`, `feishu-project-detail-refresh`,
+`feishu-project-show-comments`, `feishu-project-show-related`, and
+`feishu-project-show-history` work from their respective list/detail contexts.
+
+List filters are MCP-only. After selecting a type by key or display name, the
+backend validates the exact status (`work_item_status`), assignee, and creator
+field keys through that type's field configuration before it emits escaped MQL
+predicates. OpenAPI rejects filters explicitly rather than silently ignoring
+them. `?` opens optional lazy-loaded transient list/detail/batch menus when
+`transient` is installed; every action remains available through `M-x` without
+it.
+
+Writes are MCP-only and always require explicit confirmation. Field edits,
+state transitions, comments, batch edits, and creates validate the current
+server schema first. A state transition queries allowed transitions and required
+fields before confirmation; required fields stop the transition instead of being
+silently guessed. Batch edits snapshot marks, validate each project/type once,
+confirm only after all schemas pass, and report final success/failure IDs.
+Create validates enabled template `option_id` values and uses aggregate
+`FieldConfList` metadata to reject missing required fields. Comment deletion is
+not exposed because the MCP contract does not verify it.
+
+Attachments support only direct single-part transfers. Upload metadata uses
+attachment resource type `15`; download takes the MCP-provided `file_url`.
+Multipart metadata is rejected. The temporary signed URL, file token, and
+`X-Meego-File-Sign` header are used only for the transfer and are never shown,
+logged, or persisted.
+
 ## Commands and keys
 
 - `M-x feishu-project-list` lists work items.
@@ -89,8 +123,11 @@ duplicate requests, and ignores stale asynchronous results.
 make
 ```
 
-The test suite never contacts Feishu, starts OAuth, or requires `mcp.el`.
-It tests backend dispatch, OpenAPI request headers, MCP payload normalization,
-MQL continuation, detail truncation, malformed results, and stale callbacks.
+The test suite never contacts Feishu, starts OAuth, transfers files, or requires
+`mcp.el`. It tests backend dispatch, OpenAPI request headers, MCP payload
+normalization, MQL continuation and schema-aware filters, schema-first create
+and transition validation, comment and batch payloads, exact single-part
+attachment transfer contracts, column/mark/export behavior, lazy transient
+menus, and stale callbacks.
 
 Licensed under GPL-3.0-or-later.
