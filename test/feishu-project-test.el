@@ -11,6 +11,18 @@
     (updated_at . 1761475143215)
     (work_item_status . ((state_key . "doing")))))
 
+(ert-deftest feishu-project-test-environment-defaults ()
+  (let ((process-environment (copy-sequence process-environment)))
+    (setenv "FEISHU_PROJECT_HOST" "https://project.example.com")
+    (setenv "FEISHU_PROJECT_KEY" "example-project")
+    (setenv "FEISHU_PROJECT_USER_KEY" "example-user")
+    (should (equal (eval (car (get 'feishu-project-host 'standard-value)))
+                   "https://project.example.com"))
+    (should (equal (eval (car (get 'feishu-project-project-key 'standard-value)))
+                   "example-project"))
+    (should (equal (eval (car (get 'feishu-project-user-key 'standard-value)))
+                   "example-user"))))
+
 (ert-deftest feishu-project-test-item-accessors ()
   (should (equal (feishu-project--item-id feishu-project-test--item)
                  "7107052352"))

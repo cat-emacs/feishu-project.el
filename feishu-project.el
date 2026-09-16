@@ -4,7 +4,7 @@
 
 ;; Author: Misaka <chuxubank@qq.com>
 ;; Maintainer: Misaka <chuxubank@qq.com>
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, hypermedia
 ;; URL: https://github.com/cat-emacs/feishu-project.el
@@ -40,21 +40,27 @@
   :group 'tools
   :prefix "feishu-project-")
 
-(defcustom feishu-project-host "https://project.feishu.cn"
-  "Feishu Project host, without a trailing slash."
+(defcustom feishu-project-host
+  (or (getenv "FEISHU_PROJECT_HOST") "https://project.feishu.cn")
+  "Feishu Project host, without a trailing slash.
+The default comes from FEISHU_PROJECT_HOST when it is set."
   :type 'string)
 
-(defcustom feishu-project-project-key nil
-  "Default project key or project simple name."
+(defcustom feishu-project-project-key
+  (getenv "FEISHU_PROJECT_KEY")
+  "Default project key or project simple name.
+The default comes from FEISHU_PROJECT_KEY when it is set."
   :type '(choice (const :tag "Prompt" nil) string))
 
 (defcustom feishu-project-work-item-type-keys nil
   "Default work item type keys used by OpenAPI filters."
   :type '(repeat string))
 
-(defcustom feishu-project-user-key nil
+(defcustom feishu-project-user-key
+  (getenv "FEISHU_PROJECT_USER_KEY")
   "User key sent with a plugin access token.
-Leave nil when the token is a user access token."
+The default comes from FEISHU_PROJECT_USER_KEY when it is set.  Leave nil
+when the token is a user access token."
   :type '(choice (const :tag "Not required" nil) string))
 
 (defcustom feishu-project-access-token nil
