@@ -226,6 +226,7 @@
         (feishu-project-mcp--pending nil)
         (mcp-server-connections (make-hash-table :test #'equal))
         initial-callback
+        connection-arguments
         sent)
     (cl-letf (((symbol-function 'feishu-project-mcp--require-runtime)
                #'ignore)
@@ -237,7 +238,8 @@
                (lambda (name &rest arguments)
                  (let ((connection 'initializing))
                    (puthash name connection mcp-server-connections)
-                   (setq initial-callback
+                   (setq connection-arguments arguments
+                         initial-callback
                          (plist-get arguments :initial-callback)))))
               ((symbol-function 'mcp-async-call-tool)
                (lambda (_connection tool _arguments _success _failure)
@@ -246,6 +248,12 @@
       (feishu-project-mcp--call "second" nil #'ignore #'ert-fail)
       (should feishu-project-mcp--connecting)
       (should (= 2 (length feishu-project-mcp--pending)))
+      (should (equal (plist-get connection-arguments :url)
+                     feishu-project-mcp-url))
+      (should (eq (plist-get connection-arguments :transport) 'streamable))
+      (should (equal (plist-get connection-arguments :oauth)
+                     feishu-project-mcp-oauth))
+      (should-not (plist-member connection-arguments :command))
       (should-not sent)
       (funcall initial-callback 'connected)
       (should-not feishu-project-mcp--connecting)

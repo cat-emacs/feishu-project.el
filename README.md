@@ -45,24 +45,24 @@ list of normalized item alists and own their own pagination.
 ## MCP backend
 
 The MCP backend uses the official `https://project.feishu.cn/mcp_server/v1`
-server.  It needs Emacs 30.1, [`mcp.el`](https://github.com/lizqwerscott/mcp.el)
-version 0.1.0 at revision `2d172809cbdb2a40d86b28ad73bd65547cefe0e1`, Node.js,
-and `npx`.  It starts the pinned `mcp-remote@0.14.2` stdio bridge:
+server. It requires Emacs 30.1 and the temporary
+[`cat-emacs/mcp.el`](https://github.com/cat-emacs/mcp.el) OAuth branch at
+revision `0f18e48fd47793e326f25d70ca0fc79fce2f69a6` or newer:
 
 ```elisp
 (use-package mcp
   :if EMACS30+
-  :vc (:url "https://github.com/lizqwerscott/mcp.el"
-       :rev "2d172809cbdb2a40d86b28ad73bd65547cefe0e1"))
+  :vc (:url "https://github.com/cat-emacs/mcp.el"
+       :rev "0f18e48fd47793e326f25d70ca0fc79fce2f69a6"))
 
 (setq feishu-project-backend 'mcp)
 ```
 
-`mcp-remote`, not Emacs Lisp, performs OAuth discovery, dynamic registration,
-PKCE/device authorization, token storage, and refresh.  The first request may
-open a browser or print a device authorization URL in the `mcp-remote` stderr
-buffer.  It stores OAuth state under `~/.mcp-auth/`; do not add tokens to
-Emacs Custom values or shell arguments.
+`mcp.el` performs protected-resource discovery, dynamic public-client
+registration, device authorization, token storage, and refresh. The first
+request opens the verification URL in a browser and asks for the displayed
+user code. OAuth state is stored under `~/.emacs.d/mcp-oauth/` by default;
+do not add tokens to Emacs Custom values or shell arguments.
 
 MCP list queries first retrieve enabled work-item types, then build a minimal
 MQL query for the selected type.  Name filtering is deliberately omitted from

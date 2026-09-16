@@ -1,12 +1,12 @@
 ;;; feishu-project-mcp.el --- Feishu Project MCP backend -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Misaka
-;; Package-Requires: ((emacs "30.1") (mcp "0.1.0"))
+;; Package-Requires: ((emacs "30.1") (mcp "0.2.0"))
 
 ;;; Commentary:
 
-;; Optional MCP backend.  mcp.el is used only over stdio.  The mcp-remote
-;; process owns OAuth registration, authorization, token storage, and refresh.
+;; Optional MCP backend using mcp.el Streamable HTTP and native OAuth device
+;; authorization.  OAuth credentials are owned and refreshed by mcp.el.
 
 ;;; Code:
 
@@ -20,15 +20,11 @@
 (declare-function mcp--server-running-p "mcp")
 (declare-function mcp--status "mcp")
 
-(defcustom feishu-project-mcp-command "npx"
-  "Command used to run mcp-remote."
+(defcustom feishu-project-mcp-oauth
+  '(:client-name "feishu-project.el" :open-browser t)
+  "OAuth configuration passed to `mcp-connect-server'."
   :group 'feishu-project
-  :type 'string)
-
-(defcustom feishu-project-mcp-remote-version "0.14.2"
-  "Exact mcp-remote npm version."
-  :group 'feishu-project
-  :type 'string)
+  :type 'plist)
 
 (defcustom feishu-project-mcp-url "https://project.feishu.cn/mcp_server/v1"
   "Official Feishu Project MCP URL."
@@ -199,14 +195,13 @@
   "Load and validate the optional MCP runtime on first actual operation."
   (unless (version<= "30.1" emacs-version)
     (user-error "MCP backend requires Emacs 30.1 or newer"))
-  (unless (executable-find feishu-project-mcp-command)
-    (user-error "MCP backend requires executable %s"
-                feishu-project-mcp-command))
   (require 'mcp)
+  (require 'mcp-oauth)
   (unless (and (fboundp 'mcp-connect-server)
                (fboundp 'mcp-async-call-tool)
+               (fboundp 'mcp-oauth-create)
                (boundp 'mcp-server-connections))
-    (user-error "MCP backend requires mcp.el 0.1.0 or newer")))
+    (user-error "MCP backend requires mcp.el 0.2.0 or newer")))
 
 (defun feishu-project-mcp--connection-live-p (connection)
   "Return non-nil when CONNECTION completed MCP initialization."
@@ -254,7 +249,7 @@ before reconnecting."
         (apply #'feishu-project-mcp--call-now connection call)))))
 
 (defun feishu-project-mcp--start-connection ()
-  "Start mcp-remote and queue calls until mcp.el invokes its callback."
+  "Connect to Feishu MCP and queue calls until initialization completes."
   (feishu-project-mcp--require-runtime)
   (feishu-project-mcp--clear-stale-connection)
   (unless feishu-project-mcp--connecting
@@ -262,11 +257,9 @@ before reconnecting."
     (condition-case err
         (mcp-connect-server
          feishu-project-mcp-server-name
-         :command feishu-project-mcp-command
-         :args (list "--yes"
-                     (format "mcp-remote@%s"
-                             feishu-project-mcp-remote-version)
-                     feishu-project-mcp-url)
+         :url feishu-project-mcp-url
+         :transport 'streamable
+         :oauth feishu-project-mcp-oauth
          :timeout feishu-project-mcp-timeout
          :initial-callback #'feishu-project-mcp--flush-pending
          :error-callback
