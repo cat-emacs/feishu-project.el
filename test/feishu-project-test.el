@@ -73,6 +73,21 @@
              (item (car (alist-get 'data response))))
         (should (= 7 (alist-get 'id item)))))))
 
+(ert-deftest feishu-project-test-openapi-detail-uses-type-key ()
+  (let (requested-path)
+    (cl-letf (((symbol-function 'feishu-project-openapi--request)
+               (lambda (path _body)
+                 (setq requested-path path)
+                 '((data . (((id . 7))))))))
+      (feishu-project-openapi--detail
+       '((id . 7)
+         (simple_name . "example")
+         (work_item_type_key . "bug")
+         (work_item_type . "缺陷"))
+       nil #'ignore #'ert-fail)
+      (should (equal requested-path
+                     "/open_api/example/work_item/bug/query")))))
+
 (ert-deftest feishu-project-test-backend-dispatch-default-openapi ()
   (let ((feishu-project-backend 'openapi))
     (should (eq (plist-get (feishu-project--backend) :list)

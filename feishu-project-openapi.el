@@ -135,7 +135,7 @@ MQL is not an OpenAPI endpoint; this preserves the former user bridge."
   "Fetch ITEM details and call SUCCESS or FAILURE."
   (condition-case err
       (let* ((project (feishu-project--item-project item))
-             (type (feishu-project--item-type item))
+             (type (feishu-project--item-type-key item))
              (response
               (feishu-project-openapi--request
                (format "/open_api/%s/work_item/%s/query"
