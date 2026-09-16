@@ -131,18 +131,32 @@ with the originating list buffer and generation.  Results contain :items or
                     (feishu-project--get 'title item)
                     "")))
 
-(defun feishu-project--item-type (item)
-  "Return ITEM's work item type key."
+(defun feishu-project--item-type-key (item)
+  "Return ITEM's stable work item type key."
   (format "%s" (or (feishu-project--get 'work_item_type_key item)
                     (feishu-project--get 'work_item_type item)
                     "")))
 
+(defun feishu-project--item-type (item)
+  "Return ITEM's work item type display name."
+  (format "%s" (or (feishu-project--get 'work_item_type item)
+                    (feishu-project--get 'work_item_type_key item)
+                    "")))
+
 (defun feishu-project--item-status (item)
-  "Return ITEM's current status."
-  (let ((status (feishu-project--get 'work_item_status item)))
+  "Return ITEM's current status display name."
+  (let* ((status (feishu-project--get 'work_item_status item))
+         (option (and (listp status)
+                      (listp (car status))
+                      (car status))))
     (format "%s" (or (and (listp status)
                             (or (feishu-project--get 'name status)
+                                (feishu-project--get 'label status)
                                 (feishu-project--get 'state_key status)))
+                     (and option
+                          (or (feishu-project--get 'name option)
+                              (feishu-project--get 'label option)
+                              (feishu-project--get 'state_key option)))
                      (feishu-project--get 'current_status_name item)
                      ""))))
 
@@ -162,12 +176,12 @@ with the originating list buffer and generation.  Results contain :items or
 (defun feishu-project-item-url (item)
   "Return the browser URL for ITEM.
 Arbitrary MQL results without a type cannot form a Feishu detail URL."
-  (when (string-empty-p (feishu-project--item-type item))
+  (when (string-empty-p (feishu-project--item-type-key item))
     (user-error "This result has no work item type; its detail URL is unavailable"))
   (format "%s/%s/%s/detail/%s"
           (feishu-project--host)
           (url-hexify-string (feishu-project--item-project item))
-          (url-hexify-string (feishu-project--item-type item))
+          (url-hexify-string (feishu-project--item-type-key item))
           (url-hexify-string (feishu-project--item-id item))))
 
 (defun feishu-project--request-current-p (context)

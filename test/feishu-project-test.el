@@ -33,6 +33,14 @@
                  "7107052352"))
   (should (equal (feishu-project--item-status feishu-project-test--item)
                  "doing"))
+  (should (equal (feishu-project--item-type
+                  '((work_item_type_key . "bug")
+                    (work_item_type . "缺陷")))
+                 "缺陷"))
+  (should (equal (feishu-project--item-status
+                  '((work_item_status
+                     . (((key . "doing") (label . "处理中"))))))
+                 "处理中"))
   (let ((feishu-project-host "https://project.feishu.cn/"))
     (should (equal (feishu-project-item-url feishu-project-test--item)
                    "https://project.feishu.cn/example/bug/detail/7107052352")))
@@ -95,12 +103,14 @@
 (ert-deftest feishu-project-test-mcp-mql-unpack-and-continuation ()
   (let* ((payload
           (feishu-project-mcp--json
-           "{\"list\":[{\"group_infos\":[{\"group_id\":\"1\"}],\"count\":51}],\"session_id\":\"s\",\"data\":{\"1\":[{\"moql_field_list\":[{\"key\":\"work_item_id\",\"value_type\":\"long_value\",\"value\":{\"long_value\":7}},{\"key\":\"name\",\"value_type\":\"string_value\",\"value\":{\"string_value\":\"A\"}}]}]}}"))
+           "{\"list\":[{\"group_infos\":[{\"group_id\":\"1\"}],\"count\":51}],\"session_id\":\"s\",\"data\":{\"1\":[{\"moql_field_list\":[{\"key\":\"work_item_id\",\"value_type\":\"long_value\",\"value\":{\"long_value\":7}},{\"key\":\"name\",\"value_type\":\"string_value\",\"value\":{\"string_value\":\"A\"}},{\"key\":\"work_item_status\",\"value_type\":\"key_label_value_list\",\"value\":{\"key_label_value_list\":[{\"key\":\"doing\",\"label\":\"处理中\"}]}}]}]}}"))
          (result (feishu-project-mcp--mql-result
                   payload "example" '(:key "bug" :name "Bug") "SELECT ..."))
          (item (car (plist-get result :items))))
     (should (= 7 (alist-get 'work_item_id item)))
     (should (equal "bug" (alist-get 'work_item_type_key item)))
+    (should (equal "Bug" (alist-get 'work_item_type item)))
+    (should (equal "处理中" (feishu-project--item-status item)))
     (should (equal "s"
                    (plist-get (plist-get result :continuation) :session-id)))
     (should (= 1 (plist-get (plist-get result :continuation) :fetched)))

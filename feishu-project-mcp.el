@@ -105,7 +105,8 @@
 (defun feishu-project-mcp--mql-row (row project type)
   "Normalize MQL ROW, injecting PROJECT and selected TYPE."
   (let ((item `((simple_name . ,project)
-                (work_item_type_key . ,(plist-get type :key)))))
+                (work_item_type_key . ,(plist-get type :key))
+                (work_item_type . ,(plist-get type :name)))))
     (dolist (field (alist-get 'moql_field_list row))
       (let ((key (alist-get 'key field))
             (value (feishu-project-mcp--field-value field)))
@@ -338,7 +339,7 @@ before reconnecting."
                               :key (lambda (value) (plist-get value :name))
                               :test #'equal))
                (mql (format
-                     "SELECT `work_item_id`, `name`, `updated_at` FROM `%s`.`%s` LIMIT %d"
+                     "SELECT `work_item_id`, `name`, `work_item_status`, `updated_at` FROM `%s`.`%s` LIMIT %d"
                      project (plist-get type :key) feishu-project-page-size)))
           (unless type
             (funcall failure "No Feishu Project work item type was selected"))
