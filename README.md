@@ -1,8 +1,10 @@
 # feishu-project.el
 
-Browse [Feishu Project](https://project.feishu.cn/) work items without leaving
-Emacs. The package provides tabulated work-item results, detail views, OpenAPI
-filtering and an extension point for MQL backends.
+Browse [Feishu Project](https://project.feishu.cn/) work items from Emacs.
+`feishu-project.el` has two interchangeable, read-only backends: the original
+plugin-token OpenAPI backend and an optional user-OAuth MCP backend.  The
+default is `openapi`, so upgrading does not start Node, open a browser, or
+change existing credentials.
 
 ## Installation
 
@@ -11,68 +13,84 @@ filtering and an extension point for MQL backends.
   :vc (:url "https://github.com/cat-emacs/feishu-project.el")
   :commands (feishu-project-list feishu-project-mql)
   :custom
-  (feishu-project-project-key "my-project")
-  (feishu-project-work-item-type-keys '("story" "bug")))
+  (feishu-project-project-key "my-project"))
 ```
 
-## Authentication
+The common UI requires Emacs 29.1.  `feishu-project.el` is the UI and backend
+protocol; `feishu-project-openapi.el` and `feishu-project-mcp.el` are loaded
+only when their backend is selected.
 
-Use a user access token by itself, or a plugin/virtual-plugin access token with
-a user key:
+## OpenAPI backend (default)
+
+OpenAPI requires a Feishu Project plugin or user token.  A plugin/virtual-plugin
+token also requires the user key:
 
 ```sh
 export FEISHU_PROJECT_TOKEN='u-...'
-# Required only for p-... or v-... tokens:
 export FEISHU_PROJECT_USER_KEY='...'
 export FEISHU_PROJECT_KEY='my-project'
 ```
 
-Instead of `FEISHU_PROJECT_TOKEN`, put the token in `auth-source`:
+Instead of `FEISHU_PROJECT_TOKEN`, `auth-source` can supply it:
 
 ```text
 machine project.feishu.cn password u-...
 ```
 
-## Commands
+`feishu-project-list` prompts for OpenAPI type keys (with
+`feishu-project-work-item-type-keys` as its default).  Existing custom MQL
+bridges remain supported through `feishu-project-mql-function`; they return a
+list of normalized item alists and own their own pagination.
 
-- `M-x feishu-project-list` filters work items by project, type and name.
-- `M-x feishu-project-mql` runs a complete MQL query through a configured
-  `feishu-project-mql-function`.
+## MCP backend
 
-List keys: `RET` details, `o` browser, `w` copy ID, `W` copy URL, `g` refresh,
-`n`/`p` next/previous page, and `q` quit. Detail keys: `o`, `W`, and `q`.
-
-## MQL backend
-
-Feishu exposes MQL execution through its MCP `search_by_mql` tool rather than
-the documented OpenAPI. The backend function receives `(PROJECT-KEY MQL)` and
-returns a list of work-item alists. Rows should include `work_item_id` (or
-`id`), `name`, and `work_item_type_key`; `simple_name`,
-`current_status_name`, and `updated_at` improve the display and browser links.
+The MCP backend uses the official `https://project.feishu.cn/mcp_server/v1`
+server.  It needs Emacs 30.1, [`mcp.el`](https://github.com/lizqwerscott/mcp.el)
+version 0.1.0 at revision `2d172809cbdb2a40d86b28ad73bd65547cefe0e1`, Node.js,
+and `npx`.  It starts the pinned `mcp-remote@0.14.2` stdio bridge:
 
 ```elisp
-(defun my-feishu-project-mql (project-key mql)
-  ;; Call Feishu Project MCP search_by_mql and normalize its rows.
-  ;; Return: '(((work_item_id . 123) (name . "Example")
-  ;;            (work_item_type_key . "story") ...))
-  )
+(use-package mcp
+  :if EMACS30+
+  :vc (:url "https://github.com/lizqwerscott/mcp.el"
+       :rev "2d172809cbdb2a40d86b28ad73bd65547cefe0e1"))
 
-(setq feishu-project-mql-function #'my-feishu-project-mql
-      feishu-project-saved-mql
-      '(("My open stories" .
-         "SELECT `work_item_id`, `name`, `current_status_name`
-          FROM `MySpace`.`需求`
-          WHERE `创建人` = current_login_user()")))
+(setq feishu-project-backend 'mcp)
 ```
 
-MQL identifiers in `SELECT` and `WHERE` must use backticks. MQL pagination
-belongs to the backend because MCP uses a `session_id` and per-group pagination
-rather than OpenAPI page numbers.
+`mcp-remote`, not Emacs Lisp, performs OAuth discovery, dynamic registration,
+PKCE/device authorization, token storage, and refresh.  The first request may
+open a browser or print a device authorization URL in the `mcp-remote` stderr
+buffer.  It stores OAuth state under `~/.mcp-auth/`; do not add tokens to
+Emacs Custom values or shell arguments.
+
+MCP list queries first retrieve enabled work-item types, then build a minimal
+MQL query for the selected type.  Name filtering is deliberately omitted from
+that generated MQL because field schemas differ; use `feishu-project-mql` for
+schema-specific conditions.  MQL pagination keeps the server-issued
+`session_id` and group continuation privately.  Detail requests request `_all`
+fields; if the server says more field pages exist, the detail buffer explicitly
+marks the result truncated rather than claiming completeness.  Arbitrary MQL
+may omit a type key, in which case browser/detail URLs are unavailable.
+
+## Commands and keys
+
+- `M-x feishu-project-list` lists work items.
+- `M-x feishu-project-mql` runs a complete MQL query.
+- List: `RET` details, `o` browser, `w` copy ID, `W` copy URL, `g` refresh,
+  `n`/`p` next/previous page, `q` quit.
+
+The UI is callback-first: it renders a loading state immediately, prevents
+duplicate requests, and ignores stale asynchronous results.
 
 ## Development
 
 ```sh
 make
 ```
+
+The test suite never contacts Feishu, starts OAuth, or requires `mcp.el`.
+It tests backend dispatch, OpenAPI request headers, MCP payload normalization,
+MQL continuation, detail truncation, malformed results, and stale callbacks.
 
 Licensed under GPL-3.0-or-later.

@@ -1,39 +1,31 @@
 ;;; feishu-project.el --- Browse Feishu Project work items -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2026  Misaka
-
+;; Copyright (C) 2026 Misaka
 ;; Author: Misaka <chuxubank@qq.com>
 ;; Maintainer: Misaka <chuxubank@qq.com>
-;; Version: 0.1.1
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, hypermedia
 ;; URL: https://github.com/cat-emacs/feishu-project.el
 
-;; This file is free software; you can redistribute it and/or modify
-;; it under the terms of the GNU General Public License as published by
-;; the Free Software Foundation, either version 3 of the License, or
-;; (at your option) any later version.
+;; This file is free software; you can redistribute it and/or modify it under
+;; the terms of the GNU General Public License as published by the Free
+;; Software Foundation, either version 3 of the License, or (at your option)
+;; any later version.
 
 ;;; Commentary:
 
-;; Browse Feishu Project work items with OpenAPI filters, or use a
-;; user-supplied MQL backend.  Credentials are read from auth-source by
-;; default; see `feishu-project-access-token'.
+;; Common UI and callback-first backend protocol.  The OpenAPI backend remains
+;; the default; the MCP backend is optional and loaded on demand.
 
 ;;; Code:
 
-(require 'auth-source)
 (require 'browse-url)
 (require 'cl-lib)
-(require 'json)
 (require 'pp)
 (require 'subr-x)
 (require 'tabulated-list)
 (require 'url)
-(require 'url-http)
-
-(defvar url-http-end-of-headers)
-(defvar url-http-response-status)
 
 (defgroup feishu-project nil
   "Emacs interface to Feishu Project."
@@ -42,47 +34,25 @@
 
 (defcustom feishu-project-host
   (or (getenv "FEISHU_PROJECT_HOST") "https://project.feishu.cn")
-  "Feishu Project host, without a trailing slash.
-The default comes from FEISHU_PROJECT_HOST when it is set."
+  "Feishu Project host, without a trailing slash."
   :type 'string)
 
 (defcustom feishu-project-project-key
   (getenv "FEISHU_PROJECT_KEY")
-  "Default project key or project simple name.
-The default comes from FEISHU_PROJECT_KEY when it is set."
+  "Default project key or project simple name."
   :type '(choice (const :tag "Prompt" nil) string))
 
-(defcustom feishu-project-work-item-type-keys nil
-  "Default work item type keys used by OpenAPI filters."
-  :type '(repeat string))
-
-(defcustom feishu-project-user-key
-  (getenv "FEISHU_PROJECT_USER_KEY")
-  "User key sent with a plugin access token.
-The default comes from FEISHU_PROJECT_USER_KEY when it is set.  Leave nil
-when the token is a user access token."
-  :type '(choice (const :tag "Not required" nil) string))
-
-(defcustom feishu-project-access-token nil
-  "OpenAPI token, or a function returning it.
-When nil, use FEISHU_PROJECT_TOKEN or auth-source."
-  :type '(choice (const :tag "Use environment or auth-source" nil)
-                 string function))
+(defcustom feishu-project-backend 'openapi
+  "Backend used for Feishu Project requests."
+  :type '(choice (const :tag "OpenAPI" openapi)
+                 (const :tag "MCP" mcp)))
 
 (defcustom feishu-project-page-size 100
-  "Number of work items fetched per OpenAPI page."
+  "Preferred number of rows requested by a backend."
   :type 'integer)
 
-(defcustom feishu-project-mql-function nil
-  "Function used to execute MQL queries.
-It receives PROJECT-KEY and MQL and returns a list of work item alists.
-MQL is exposed by Feishu Project MCP rather than the documented OpenAPI;
-configure this hook to bridge that service into Emacs."
-  :type '(choice (const :tag "Not configured" nil) function))
-
 (defcustom feishu-project-saved-mql nil
-  "Named MQL queries offered by `feishu-project-mql'.
-Each entry has the form (NAME . QUERY)."
+  "Named MQL queries offered by `feishu-project-mql'."
   :type '(alist :key-type string :value-type string))
 
 (defcustom feishu-project-list-columns
@@ -91,247 +61,222 @@ Each entry has the form (NAME . QUERY)."
     ("Status" 18 feishu-project--item-status)
     ("Updated" 17 feishu-project--item-updated)
     ("Name" 60 feishu-project--item-name))
-  "Columns displayed by `feishu-project-list-mode'.
-Each element is (TITLE WIDTH VALUE-FUNCTION)."
+  "Columns displayed by `feishu-project-list-mode'."
   :type '(repeat (list string integer function)))
+
+(defvar feishu-project--backends (make-hash-table :test #'eq)
+  "Mapping of backend names to callback-first protocol plists.")
+
+(defvar-local feishu-project--backend-name nil)
+
+(defun feishu-project-register-backend (name protocol)
+  "Register NAME with callback-first PROTOCOL.
+A list function receives PROJECT, TYPE-SPEC, NAME, PAGE-TOKEN, CONTEXT,
+SUCCESS, and FAILURE.  An MQL function omits TYPE-SPEC and NAME.  A detail
+function receives ITEM, CONTEXT, SUCCESS, and FAILURE.  CONTEXT is a plist
+with the originating list buffer and generation.  Results contain :items or
+:item, :total, and an opaque :continuation where appropriate."
+  (puthash name protocol feishu-project--backends))
+
+(defun feishu-project--backend (&optional name)
+  "Return backend NAME, loading it only when needed."
+  (let ((name (or name feishu-project--backend-name feishu-project-backend)))
+    (unless (gethash name feishu-project--backends)
+      (pcase name
+        ('openapi (require 'feishu-project-openapi))
+        ('mcp (require 'feishu-project-mcp))
+        (_ (user-error "Unknown Feishu Project backend: %S" name))))
+    (or (gethash name feishu-project--backends)
+        (error "Feishu Project backend %S did not register" name))))
+
+(defun feishu-project--backend-function (key &optional name)
+  "Return backend NAME's function for KEY."
+  (let ((name (or name feishu-project--backend-name feishu-project-backend)))
+    (or (plist-get (feishu-project--backend name) key)
+        (user-error "Backend %S does not support %s" name key))))
+
+(defun feishu-project--get (key object)
+  "Return KEY from plist or alist OBJECT, accepting symbol or string keys."
+  (or (and (listp object) (plist-get object key))
+      (and (listp object) (alist-get key object))
+      (and (symbolp key)
+           (listp object)
+           (alist-get (symbol-name key) object nil nil #'equal))))
 
 (defvar-local feishu-project--items nil)
 (defvar-local feishu-project--query nil)
-(defvar-local feishu-project--query-kind 'filter)
+(defvar-local feishu-project--query-kind nil)
 (defvar-local feishu-project--project-key nil)
-(defvar-local feishu-project--type-keys nil)
-(defvar-local feishu-project--page 1)
+(defvar-local feishu-project--type-spec nil)
+(defvar-local feishu-project--current-page-token nil)
+(defvar-local feishu-project--next-page-token nil)
+(defvar-local feishu-project--page-history nil)
 (defvar-local feishu-project--total nil)
+(defvar-local feishu-project--loading nil)
+(defvar-local feishu-project--generation 0)
 
 (defun feishu-project--host ()
   "Return the configured host without a trailing slash."
   (string-remove-suffix "/" feishu-project-host))
 
-(defun feishu-project--auth-host ()
-  "Return the host name used for auth-source lookup."
-  (url-host (url-generic-parse-url (feishu-project--host))))
-
-(defun feishu-project--secret-string (secret)
-  "Resolve SECRET returned by auth-source to a string."
-  (if (functionp secret) (funcall secret) secret))
-
-(defun feishu-project--token ()
-  "Return the configured OpenAPI token."
-  (or (and (functionp feishu-project-access-token)
-           (funcall feishu-project-access-token))
-      (and (stringp feishu-project-access-token)
-           (not (string-empty-p feishu-project-access-token))
-           feishu-project-access-token)
-      (getenv "FEISHU_PROJECT_TOKEN")
-      (let ((entry (car (auth-source-search
-                         :host (feishu-project--auth-host)
-                         :require '(:secret)
-                         :max 1))))
-        (and entry (feishu-project--secret-string
-                    (plist-get entry :secret))))
-      (user-error "Set FEISHU_PROJECT_TOKEN or add %s to auth-source"
-                  (feishu-project--auth-host))))
-
-(defun feishu-project--headers ()
-  "Return HTTP headers for an OpenAPI request."
-  (append `(("Content-Type" . "application/json")
-            ("Accept" . "application/json")
-            ("X-Plugin-Token" . ,(feishu-project--token)))
-          (when (and feishu-project-user-key
-                     (not (string-empty-p feishu-project-user-key)))
-            `(("X-User-Key" . ,feishu-project-user-key)))))
-
-(defun feishu-project--json-body (body)
-  "Encode BODY as UTF-8 JSON."
-  (encode-coding-string (json-serialize body :null-object nil) 'utf-8))
-
-(defun feishu-project--request (path body)
-  "POST BODY to PATH and return the decoded response alist."
-  (let* ((url-request-method "POST")
-         (url-request-extra-headers (feishu-project--headers))
-         (url-request-data (feishu-project--json-body body))
-         (url (concat (feishu-project--host) path))
-         (buffer (url-retrieve-synchronously url t t 30)))
-    (unless buffer
-      (error "Feishu Project request timed out: %s" path))
-    (unwind-protect
-        (with-current-buffer buffer
-          (let ((status url-http-response-status)
-                (header-end url-http-end-of-headers))
-            (unless (and status (integer-or-marker-p header-end))
-              (error "Invalid HTTP response from Feishu Project"))
-            (goto-char header-end)
-            (let ((response (json-parse-buffer
-                             :object-type 'alist
-                             :array-type 'list
-                             :null-object nil
-                             :false-object nil)))
-              (unless (and (<= 200 status) (< status 300))
-                (error "Feishu Project HTTP %d: %s" status response))
-              (let ((code (alist-get 'err_code response)))
-                (unless (or (null code) (equal code 0))
-                  (error "Feishu Project error %s: %s"
-                         code (or (alist-get 'err_msg response)
-                                  (alist-get 'err response)))))
-              response)))
-      (kill-buffer buffer))))
-
-(defun feishu-project--alist-get (key alist)
-  "Return KEY from ALIST, accepting symbol and string keys."
-  (or (alist-get key alist)
-      (alist-get (symbol-name key) alist nil nil #'equal)))
-
 (defun feishu-project--item-id (item)
   "Return ITEM's ID as a string."
-  (format "%s" (or (feishu-project--alist-get 'id item)
-                    (feishu-project--alist-get 'work_item_id item)
+  (format "%s" (or (feishu-project--get 'id item)
+                    (feishu-project--get 'work_item_id item)
                     "")))
 
 (defun feishu-project--item-name (item)
   "Return ITEM's display name."
-  (format "%s" (or (feishu-project--alist-get 'name item)
-                    (feishu-project--alist-get 'title item)
+  (format "%s" (or (feishu-project--get 'name item)
+                    (feishu-project--get 'title item)
                     "")))
 
 (defun feishu-project--item-type (item)
   "Return ITEM's work item type key."
-  (format "%s" (or (feishu-project--alist-get 'work_item_type_key item)
-                    (feishu-project--alist-get 'work_item_type item)
+  (format "%s" (or (feishu-project--get 'work_item_type_key item)
+                    (feishu-project--get 'work_item_type item)
                     "")))
 
 (defun feishu-project--item-status (item)
-  "Return ITEM's current status or node names."
-  (let* ((status (feishu-project--alist-get 'work_item_status item))
-         (nodes (feishu-project--alist-get 'current_nodes item))
-         (state (and (listp status)
-                     (feishu-project--alist-get 'state_key status))))
-    (or state
-        (and nodes
-             (mapconcat (lambda (node)
-                          (format "%s" (or (feishu-project--alist-get 'name node)
-                                            (feishu-project--alist-get 'id node))))
-                        nodes ", "))
-        (feishu-project--alist-get 'current_status_name item)
-        (feishu-project--alist-get 'sub_stage item)
-        "")))
-
-(defun feishu-project--format-time (milliseconds)
-  "Format MILLISECONDS since the epoch for display."
-  (if (numberp milliseconds)
-      (format-time-string "%Y-%m-%d %H:%M" (/ milliseconds 1000.0))
-    ""))
+  "Return ITEM's current status."
+  (let ((status (feishu-project--get 'work_item_status item)))
+    (format "%s" (or (and (listp status)
+                            (or (feishu-project--get 'name status)
+                                (feishu-project--get 'state_key status)))
+                     (feishu-project--get 'current_status_name item)
+                     ""))))
 
 (defun feishu-project--item-updated (item)
   "Return ITEM's update time for display."
-  (feishu-project--format-time
-   (feishu-project--alist-get 'updated_at item)))
+  (format "%s" (or (feishu-project--get 'updated_at item)
+                    (feishu-project--get 'update_time item)
+                    "")))
 
 (defun feishu-project--item-project (item)
-  "Return ITEM's project key or simple name."
-  (format "%s" (or (feishu-project--alist-get 'simple_name item)
-                    (feishu-project--alist-get 'project_key item)
+  "Return ITEM's project simple name or key."
+  (format "%s" (or (feishu-project--get 'simple_name item)
+                    (feishu-project--get 'project_key item)
                     feishu-project--project-key
                     "")))
 
 (defun feishu-project-item-url (item)
-  "Return the browser URL for ITEM."
+  "Return the browser URL for ITEM.
+Arbitrary MQL results without a type cannot form a Feishu detail URL."
+  (when (string-empty-p (feishu-project--item-type item))
+    (user-error "This result has no work item type; its detail URL is unavailable"))
   (format "%s/%s/%s/detail/%s"
           (feishu-project--host)
           (url-hexify-string (feishu-project--item-project item))
           (url-hexify-string (feishu-project--item-type item))
           (url-hexify-string (feishu-project--item-id item))))
 
-(defun feishu-project--read-project-key ()
-  "Read a project key, using the configured default."
-  (read-string "Project key or simple name: "
-               feishu-project-project-key nil
-               feishu-project-project-key))
-
-(defun feishu-project--read-type-keys ()
-  "Read comma-separated work item type keys."
-  (let* ((default (string-join feishu-project-work-item-type-keys ","))
-         (value (read-string "Work item type keys: " default)))
-    (unless (string-empty-p value)
-      (split-string value "[[:space:]]*,[[:space:]]*" t))))
-
-(defun feishu-project--filter-page (project-key type-keys page &optional name)
-  "Return one PAGE of work items from PROJECT-KEY and TYPE-KEYS.
-Filter by NAME when non-nil."
-  (let* ((path (format "/open_api/%s/work_item/filter"
-                       (url-hexify-string project-key)))
-         (body `((work_item_type_keys . ,(vconcat type-keys))
-                 (page_num . ,page)
-                 (page_size . ,feishu-project-page-size)))
-         (body (if (and name (not (string-empty-p name)))
-                   (cons `(work_item_name . ,name) body)
-                 body)))
-    (feishu-project--request path body)))
-
-(defun feishu-project--detail (item)
-  "Fetch and return complete details for ITEM."
-  (let* ((project (feishu-project--item-project item))
-         (type (feishu-project--item-type item))
-         (path (format "/open_api/%s/work_item/%s/query"
-                       (url-hexify-string project)
-                       (url-hexify-string type)))
-         (response (feishu-project--request
-                    path `((work_item_ids . ,(vector
-                                               (string-to-number
-                                                (feishu-project--item-id item))))))))
-    (car (feishu-project--alist-get 'data response))))
-
-(defun feishu-project--mql-items (project-key mql)
-  "Execute MQL for PROJECT-KEY and normalize the returned work items."
-  (unless (functionp feishu-project-mql-function)
-    (user-error "Configure `feishu-project-mql-function' to use Feishu Project MCP search_by_mql"))
-  (let ((result (funcall feishu-project-mql-function project-key mql)))
-    (cond
-     ((null result) nil)
-     ((and (listp result) (not (keywordp (car result)))) result)
-     (t (error "MQL backend must return a list of work item alists")))))
+(defun feishu-project--request-current-p (context)
+  "Return non-nil when CONTEXT still identifies the active list request."
+  (let ((buffer (plist-get context :buffer))
+        (generation (plist-get context :generation)))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (= generation feishu-project--generation)))))
 
 (defun feishu-project--entry (item)
-  "Create a tabulated list entry for ITEM."
+  "Create a tabulated-list entry for ITEM."
   (list item
         (vconcat
          (mapcar (lambda (column)
-                   (let ((value (funcall (nth 2 column) item)))
-                     (if (stringp value) value (format "%s" value))))
+                   (format "%s" (funcall (nth 2 column) item)))
                  feishu-project-list-columns))))
 
-(defun feishu-project--refresh ()
-  "Refresh the current Feishu Project work item list."
-  (condition-case err
-      (let ((inhibit-read-only t))
-        (setq feishu-project--items
-              (pcase feishu-project--query-kind
-                ('mql (feishu-project--mql-items
-                       feishu-project--project-key
-                       feishu-project--query))
-                (_ (let* ((response
-                           (feishu-project--filter-page
-                            feishu-project--project-key
-                            feishu-project--type-keys
-                            feishu-project--page
-                            feishu-project--query))
-                          (pagination
-                           (feishu-project--alist-get 'pagination response)))
-                     (setq feishu-project--total
-                           (feishu-project--alist-get 'total pagination))
-                     (feishu-project--alist-get 'data response)))))
-        (setq tabulated-list-entries
-              (mapcar #'feishu-project--entry feishu-project--items))
-        (tabulated-list-print t)
-        (message "Feishu Project: %d item%s%s"
-                 (length feishu-project--items)
-                 (if (= (length feishu-project--items) 1) "" "s")
-                 (if feishu-project--total
-                     (format " of %s" feishu-project--total)
-                   "")))
-    (error
-     (setq tabulated-list-entries nil)
-     (tabulated-list-print t)
-     (signal (car err) (cdr err)))))
+(defun feishu-project--render-list ()
+  "Render the committed items in the current list buffer."
+  (let ((inhibit-read-only t))
+    (setq tabulated-list-entries
+          (mapcar #'feishu-project--entry feishu-project--items))
+    (tabulated-list-print t)))
+
+(defun feishu-project--render-loading ()
+  "Render the loading state in the current list buffer."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert "Loading Feishu Project work items…\n")))
+
+(defun feishu-project--finish-list (result context page-token history)
+  "Render RESULT for CONTEXT and commit PAGE-TOKEN and HISTORY on success."
+  (when (feishu-project--request-current-p context)
+    (with-current-buffer (plist-get context :buffer)
+      (setq feishu-project--loading nil
+            feishu-project--items (plist-get result :items)
+            feishu-project--current-page-token
+            (if (plist-member result :current-page-token)
+                (plist-get result :current-page-token)
+              page-token)
+            feishu-project--next-page-token (plist-get result :continuation)
+            feishu-project--page-history history
+            feishu-project--total (plist-get result :total))
+      (feishu-project--render-list))))
+
+(defun feishu-project--fail-list (error context)
+  "Show ERROR for CONTEXT without changing committed page state."
+  (when (feishu-project--request-current-p context)
+    (with-current-buffer (plist-get context :buffer)
+      (setq feishu-project--loading nil)
+      (feishu-project--render-list)
+      (message "Feishu Project: %s" error))))
+
+(defun feishu-project--invoke-list-backend (context page-token history)
+  "Invoke the active backend for CONTEXT, PAGE-TOKEN and proposed HISTORY."
+  (let ((success (lambda (result)
+                   (feishu-project--finish-list result context page-token history)))
+        (failure (lambda (error)
+                   (feishu-project--fail-list error context))))
+    (condition-case err
+        (pcase feishu-project--query-kind
+          ('list
+           (funcall (feishu-project--backend-function :list)
+                    feishu-project--project-key
+                    feishu-project--type-spec
+                    feishu-project--query
+                    page-token
+                    context
+                    success
+                    failure))
+          ('mql
+           (funcall (feishu-project--backend-function :mql)
+                    feishu-project--project-key
+                    feishu-project--query
+                    page-token
+                    context
+                    success
+                    failure)))
+      (error (funcall failure (error-message-string err))))))
+
+(defun feishu-project--request-page (page-token history)
+  "Request PAGE-TOKEN with proposed HISTORY from the current list buffer.
+Page state is committed only by a successful callback."
+  (when feishu-project--loading
+    (user-error "Feishu Project request is already in progress"))
+  (let* ((buffer (current-buffer))
+         (generation (cl-incf feishu-project--generation))
+         (context (list :buffer buffer :generation generation)))
+    (setq feishu-project--loading t)
+    (feishu-project--render-loading)
+    (feishu-project--invoke-list-backend context page-token history)))
+
+(defun feishu-project--display (project-key type-spec kind query)
+  "Display KIND QUERY in PROJECT-KEY using TYPE-SPEC."
+  (let ((buffer (get-buffer-create "*Feishu Project*")))
+    (with-current-buffer buffer
+      (feishu-project-list-mode)
+      (setq feishu-project--backend-name feishu-project-backend
+            feishu-project--project-key project-key
+            feishu-project--type-spec type-spec
+            feishu-project--query-kind kind
+            feishu-project--query query
+            feishu-project--current-page-token nil
+            feishu-project--next-page-token nil
+            feishu-project--page-history nil
+            feishu-project--total nil)
+      (feishu-project--request-page nil nil))
+    (pop-to-buffer buffer)))
 
 (defun feishu-project-item-at-point ()
   "Return the work item at point or signal a user error."
@@ -341,22 +286,19 @@ Filter by NAME when non-nil."
 (defun feishu-project-open ()
   "Open the work item at point in a browser."
   (interactive)
-  (browse-url (feishu-project-item-url
-               (feishu-project-item-at-point))))
+  (browse-url (feishu-project-item-url (feishu-project-item-at-point))))
 
 (defun feishu-project-copy-url ()
   "Copy the work item URL at point."
   (interactive)
-  (let ((url (feishu-project-item-url
-              (feishu-project-item-at-point))))
+  (let ((url (feishu-project-item-url (feishu-project-item-at-point))))
     (kill-new url)
     (message "Copied %s" url)))
 
 (defun feishu-project-copy-id ()
   "Copy the work item ID at point."
   (interactive)
-  (let ((id (feishu-project--item-id
-             (feishu-project-item-at-point))))
+  (let ((id (feishu-project--item-id (feishu-project-item-at-point))))
     (kill-new id)
     (message "Copied %s" id)))
 
@@ -369,18 +311,9 @@ Filter by NAME when non-nil."
    ((eq value t) (insert "true"))
    (t (pp value (current-buffer)))))
 
-(defun feishu-project--field-name (field)
-  "Return a display name for FIELD."
-  (let ((alias (feishu-project--alist-get 'field_alias field)))
-    (format "%s" (if (and (stringp alias) (not (string-empty-p alias)))
-                       alias
-                     (or (feishu-project--alist-get 'field_key field)
-                         "field")))))
-
 (defun feishu-project--render-detail (item)
-  "Render ITEM into the current detail buffer."
-  (let ((inhibit-read-only t)
-        (fields (feishu-project--alist-get 'fields item)))
+  "Render normalized ITEM into the current detail buffer."
+  (let ((inhibit-read-only t))
     (erase-buffer)
     (insert (propertize (feishu-project--item-name item)
                         'face '(:height 1.35 :weight bold))
@@ -389,41 +322,78 @@ Filter by NAME when non-nil."
                    ("Type" . ,(feishu-project--item-type item))
                    ("Status" . ,(feishu-project--item-status item))
                    ("Project" . ,(feishu-project--item-project item))
-                   ("Created" . ,(feishu-project--format-time
-                                    (feishu-project--alist-get 'created_at item)))
-                   ("Updated" . ,(feishu-project--item-updated item))
-                   ("URL" . ,(feishu-project-item-url item))))
+                   ("Created" . ,(feishu-project--get 'created_at item))
+                   ("Updated" . ,(feishu-project--item-updated item))))
       (insert (propertize (format "%-12s" (car row)) 'face 'bold))
       (feishu-project--insert-value (cdr row))
       (insert "\n"))
-    (when fields
-      (insert "\n" (propertize "Fields" 'face '(:height 1.15 :weight bold)) "\n\n")
-      (dolist (field fields)
-        (insert (propertize (format "%s\n" (feishu-project--field-name field))
-                            'face 'bold)
-                "  ")
-        (feishu-project--insert-value
-         (feishu-project--alist-get 'field_value field))
-        (unless (bolp) (insert "\n"))
+    (when (feishu-project--get 'detail-truncated item)
+      (insert "\nDetail fields are truncated; fetch additional pages in Feishu Project.\n"))
+    (dolist (field (feishu-project--get 'fields item))
+      (insert "\n"
+              (propertize (format "%s\n"
+                                  (or (feishu-project--get 'field_alias field)
+                                      (feishu-project--get 'field_key field)))
+                          'face 'bold)
+              "  ")
+      (feishu-project--insert-value (feishu-project--get 'field_value field))
+      (unless (bolp)
         (insert "\n")))
     (goto-char (point-min))))
 
+(defun feishu-project--finish-detail (result context detail-buffer)
+  "Finish detail RESULT for CONTEXT and live DETAIL-BUFFER."
+  (when (feishu-project--request-current-p context)
+    (with-current-buffer (plist-get context :buffer)
+      (setq feishu-project--loading nil))
+    (when (buffer-live-p detail-buffer)
+      (let ((item (plist-get result :item)))
+        (with-current-buffer detail-buffer
+          (setq-local feishu-project--items (list item))
+          (feishu-project--render-detail item))))))
+
+(defun feishu-project--fail-detail (error context detail-buffer)
+  "Finish detail ERROR for CONTEXT and live DETAIL-BUFFER."
+  (when (feishu-project--request-current-p context)
+    (with-current-buffer (plist-get context :buffer)
+      (setq feishu-project--loading nil))
+    (when (buffer-live-p detail-buffer)
+      (with-current-buffer detail-buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Feishu Project: %s\n" error)))))))
+
 (defun feishu-project-show ()
-  "Show details for the work item at point."
+  "Show details for the work item at point asynchronously."
   (interactive)
-  (let* ((summary (feishu-project-item-at-point))
-         (item (feishu-project--detail summary))
-         (buffer (get-buffer-create
-                  (format "*Feishu Project %s*"
-                          (feishu-project--item-id summary)))))
-    (unless item
-      (user-error "Feishu Project returned no details for %s"
-                  (feishu-project--item-id summary)))
-    (with-current-buffer buffer
+  (when feishu-project--loading
+    (user-error "Feishu Project request is already in progress"))
+  (let* ((list-buffer (current-buffer))
+         (summary (feishu-project-item-at-point))
+         (generation (cl-incf feishu-project--generation))
+         (context (list :buffer list-buffer :generation generation))
+         (detail-function (feishu-project--backend-function :detail))
+         (detail-buffer
+          (get-buffer-create
+           (format "*Feishu Project %s*" (feishu-project--item-id summary)))))
+    (setq feishu-project--loading t)
+    (with-current-buffer detail-buffer
       (feishu-project-detail-mode)
-      (setq-local feishu-project--items (list item))
-      (feishu-project--render-detail item))
-    (pop-to-buffer buffer)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "Loading Feishu Project details…\n")))
+    (pop-to-buffer detail-buffer)
+    (condition-case err
+        (funcall detail-function
+                 summary
+                 context
+                 (lambda (result)
+                   (feishu-project--finish-detail result context detail-buffer))
+                 (lambda (error)
+                   (feishu-project--fail-detail error context detail-buffer)))
+      (error
+       (feishu-project--fail-detail (error-message-string err)
+                                    context detail-buffer)))))
 
 (defun feishu-project-detail-open ()
   "Open the detail buffer's work item in a browser."
@@ -437,54 +407,39 @@ Filter by NAME when non-nil."
     (kill-new url)
     (message "Copied %s" url)))
 
-(defun feishu-project-next-page ()
-  "Display the next OpenAPI result page."
-  (interactive)
-  (when (eq feishu-project--query-kind 'mql)
-    (user-error "MQL pagination belongs to the configured backend"))
-  (when (and feishu-project--total
-             (>= (* feishu-project--page feishu-project-page-size)
-                 feishu-project--total))
-    (user-error "Already on the last page"))
-  (cl-incf feishu-project--page)
-  (feishu-project--refresh))
+(defun feishu-project--read-project-key ()
+  "Read a project key using the configured default."
+  (read-string "Project key or simple name: "
+               feishu-project-project-key nil
+               feishu-project-project-key))
 
-(defun feishu-project-previous-page ()
-  "Display the previous OpenAPI result page."
-  (interactive)
-  (when (<= feishu-project--page 1)
-    (user-error "Already on the first page"))
-  (cl-decf feishu-project--page)
-  (feishu-project--refresh))
-
-(defun feishu-project--display (project-key type-keys kind query)
-  "Display PROJECT-KEY results of KIND using TYPE-KEYS and QUERY."
-  (let ((buffer (get-buffer-create "*Feishu Project*")))
-    (with-current-buffer buffer
-      (feishu-project-list-mode)
-      (setq feishu-project--project-key project-key
-            feishu-project--type-keys type-keys
-            feishu-project--query-kind kind
-            feishu-project--query query
-            feishu-project--page 1
-            feishu-project--total nil)
-      (feishu-project--refresh))
-    (pop-to-buffer buffer)))
+(defun feishu-project--read-type-keys ()
+  "Read comma-separated OpenAPI work item type keys."
+  (let* ((default (and (boundp 'feishu-project-work-item-type-keys)
+                       (string-join feishu-project-work-item-type-keys ",")))
+         (value (read-string "Work item type keys: " default)))
+    (unless (string-empty-p value)
+      (split-string value "[[:space:]]*,[[:space:]]*" t))))
 
 ;;;###autoload
 (defun feishu-project-list (project-key type-keys &optional name)
   "List work items in PROJECT-KEY of TYPE-KEYS, optionally matching NAME."
   (interactive
-   (list (feishu-project--read-project-key)
-         (or (feishu-project--read-type-keys)
-             (user-error "At least one work item type key is required"))
-         (let ((value (read-string "Name contains (empty for all): ")))
-           (unless (string-empty-p value) value))))
-  (feishu-project--display project-key type-keys 'filter name))
+   (progn
+     (when (eq feishu-project-backend 'openapi)
+       (require 'feishu-project-openapi))
+     (list (feishu-project--read-project-key)
+           (unless (eq feishu-project-backend 'mcp)
+             (or (feishu-project--read-type-keys)
+                 (user-error "At least one work item type key is required")))
+           (let ((value (read-string "Name contains (empty for all): ")))
+             (unless (string-empty-p value)
+               value)))))
+  (feishu-project--display project-key type-keys 'list name))
 
 ;;;###autoload
 (defun feishu-project-mql (project-key mql)
-  "Run MQL in PROJECT-KEY using `feishu-project-mql-function'."
+  "Run MQL in PROJECT-KEY through the selected backend."
   (interactive
    (let* ((project (feishu-project--read-project-key))
           (saved (and feishu-project-saved-mql
@@ -498,6 +453,28 @@ Filter by NAME when non-nil."
   (when (string-empty-p mql)
     (user-error "MQL query must not be empty"))
   (feishu-project--display project-key nil 'mql mql))
+
+(defun feishu-project-next-page ()
+  "Display the next backend page."
+  (interactive)
+  (when feishu-project--loading
+    (user-error "Feishu Project request is already in progress"))
+  (unless feishu-project--next-page-token
+    (user-error "Already on the last page"))
+  (feishu-project--request-page
+   feishu-project--next-page-token
+   (cons feishu-project--current-page-token feishu-project--page-history)))
+
+(defun feishu-project-previous-page ()
+  "Display the preceding backend page."
+  (interactive)
+  (when feishu-project--loading
+    (user-error "Feishu Project request is already in progress"))
+  (unless feishu-project--page-history
+    (user-error "Already on the first page"))
+  (feishu-project--request-page
+   (car feishu-project--page-history)
+   (cdr feishu-project--page-history)))
 
 (defvar-keymap feishu-project-list-mode-map
   :parent tabulated-list-mode-map
@@ -513,13 +490,14 @@ Filter by NAME when non-nil."
 (define-derived-mode feishu-project-list-mode tabulated-list-mode "Feishu Project"
   "Major mode for browsing Feishu Project work items."
   (setq tabulated-list-format
-        (vconcat
-         (mapcar (lambda (column)
-                   (list (nth 0 column) (nth 1 column) t))
-                 feishu-project-list-columns))
+        (vconcat (mapcar (lambda (column)
+                           (list (nth 0 column) (nth 1 column) t))
+                         feishu-project-list-columns))
         tabulated-list-padding 2
         tabulated-list-sort-key '("Updated" . t))
-  (add-hook 'tabulated-list-revert-hook #'feishu-project--refresh nil t)
+  (add-hook 'tabulated-list-revert-hook
+            (lambda () (feishu-project--request-page nil nil))
+            nil t)
   (tabulated-list-init-header))
 
 (defvar-keymap feishu-project-detail-mode-map
@@ -534,4 +512,3 @@ Filter by NAME when non-nil."
 (provide 'feishu-project)
 
 ;;; feishu-project.el ends here
-
