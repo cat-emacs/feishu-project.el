@@ -70,7 +70,7 @@
       (error "Feishu MCP tool error: %s" result)))
   (let* ((content (or (plist-get result :content)
                       (alist-get 'content result)))
-         (text (cl-loop for entry in content
+         (text (cl-loop for entry across (vconcat content)
                         when (equal (or (plist-get entry :type)
                                         (alist-get 'type entry))
                                     "text")

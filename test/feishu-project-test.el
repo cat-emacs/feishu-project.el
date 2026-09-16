@@ -79,6 +79,14 @@
               "{\"list\":[{\"type_key\":\"bug\",\"name\":\"Bug\",\"is_disable\":2},{\"type_key\":\"old\",\"name\":\"Old\",\"is_disable\":1}]}"))))))
     (should (equal (feishu-project-mcp--enabled-types payload)
                    '((:key "bug" :name "Bug")))))
+  (let ((payload
+         (feishu-project-mcp--content-json
+          '(:content
+            [(:type "text"
+              :text
+              "{\"list\":[{\"type_key\":\"bug\",\"name\":\"Bug\",\"is_disable\":2}]}")]))))
+    (should (equal (feishu-project-mcp--enabled-types payload)
+                   '((:key "bug" :name "Bug")))))
   (should-error (feishu-project-mcp--content-json '(:isError t :content nil)))
   (should-error
    (feishu-project-mcp--content-json
