@@ -20,7 +20,7 @@
 (defun feishu-project-workbench--require-action ()
   "Require an action-capable backend."
   (unless (plist-get (feishu-project--backend) :action)
-    (user-error "Feishu Project action requires the MCP backend")))
+    (user-error "Feishu Project action requires an action-capable backend")))
 
 (defun feishu-project-workbench--call (action payload success &optional failure backend)
   "Call ACTION with callbacks through the generic backend seam."
@@ -244,7 +244,10 @@
          (unless state (user-error "Transition %s is unavailable" transition-id))
          (feishu-project-workbench--call
           'transition-required
-          (append (feishu-project-workbench--payload item) (list :transition_id transition-id))
+          (append (feishu-project-workbench--payload item)
+                  (list :transition_id transition-id
+                        :state_key (or (alist-get 'state_key state)
+                                       (alist-get 'key state))))
           (lambda (required)
             (when (seq-some (lambda (field) (not (alist-get 'optional field)))
                             (or (alist-get 'list (plist-get required :data)) '()))
@@ -375,19 +378,25 @@
   (feishu-project-workbench--require-action)
   (let ((item (feishu-project-workbench--item)))
     (unless (yes-or-no-p (format "Upload %s? " (file-name-nondirectory source))) (user-error "Upload cancelled"))
-    (feishu-project-workbench--call
-     'upload-metadata
-     (append (feishu-project-workbench--payload item)
-             (list :resource_type 15 :file_name (file-name-nondirectory source)
-                   :mime_type mime :size (file-attribute-size (file-attributes source)))
-             (unless (string-empty-p field-key) (list :field_key field-key)))
-     (lambda (result)
-       (pcase-let ((`(:url ,url :sign ,sign :multipart ,multipart) (feishu-project-workbench--metadata (plist-get result :data))))
-         (when multipart (user-error "Multipart attachment upload is unsupported"))
-         (unless (and (stringp url) (stringp sign)) (user-error "Upload metadata is incomplete"))
-         (feishu-project-workbench--transfer (feishu-project-workbench--part-url url) sign "POST" mime
-                                             (with-temp-buffer (insert-file-contents-literally source) (buffer-string)))
-         (message "Feishu Project file uploaded; attachment field association was not changed"))))))
+    (if (feishu-project--backend-capable-p 'attachment-shortcuts)
+        (feishu-project-workbench--call
+         'upload-file
+         (append (feishu-project-workbench--payload item)
+                 (list :source source :mime_type mime :field_key field-key))
+         (lambda (_result) (message "Feishu Project file uploaded")))
+      (feishu-project-workbench--call
+       'upload-metadata
+       (append (feishu-project-workbench--payload item)
+               (list :resource_type 15 :file_name (file-name-nondirectory source)
+                     :mime_type mime :size (file-attribute-size (file-attributes source)))
+               (unless (string-empty-p field-key) (list :field_key field-key)))
+       (lambda (result)
+         (pcase-let ((`(:url ,url :sign ,sign :multipart ,multipart) (feishu-project-workbench--metadata (plist-get result :data))))
+           (when multipart (user-error "Multipart attachment upload is unsupported"))
+           (unless (and (stringp url) (stringp sign)) (user-error "Upload metadata is incomplete"))
+           (feishu-project-workbench--transfer (feishu-project-workbench--part-url url) sign "POST" mime
+                                               (with-temp-buffer (insert-file-contents-literally source) (buffer-string)))
+           (message "Feishu Project file uploaded; attachment field association was not changed")))))))
 
 ;;;###autoload
 (defun feishu-project-download-attachment (file-url destination)
@@ -396,14 +405,20 @@
   (feishu-project-workbench--require-action)
   (let ((item (feishu-project-workbench--item)))
     (unless (yes-or-no-p (format "Download attachment to %s? " destination)) (user-error "Download cancelled"))
-    (feishu-project-workbench--call
-     'download-metadata (append (feishu-project-workbench--payload item) (list :file_url file-url))
-     (lambda (result)
-       (pcase-let ((`(:url ,url :sign ,sign :multipart ,multipart) (feishu-project-workbench--metadata (plist-get result :data))))
-         (when multipart (user-error "Multipart attachment download is unsupported"))
-         (unless (and (stringp url) (stringp sign)) (user-error "Download metadata is incomplete"))
-         (feishu-project-workbench--transfer (feishu-project-workbench--part-url url) sign "GET" nil nil destination)
-         (message "Feishu Project attachment downloaded"))))))
+    (if (feishu-project--backend-capable-p 'attachment-shortcuts)
+        (feishu-project-workbench--call
+         'download-file
+         (append (feishu-project-workbench--payload item)
+                 (list :source file-url :destination destination))
+         (lambda (_result) (message "Feishu Project attachment downloaded")))
+      (feishu-project-workbench--call
+       'download-metadata (append (feishu-project-workbench--payload item) (list :file_url file-url))
+       (lambda (result)
+         (pcase-let ((`(:url ,url :sign ,sign :multipart ,multipart) (feishu-project-workbench--metadata (plist-get result :data))))
+           (when multipart (user-error "Multipart attachment download is unsupported"))
+           (unless (and (stringp url) (stringp sign)) (user-error "Download metadata is incomplete"))
+           (feishu-project-workbench--transfer (feishu-project-workbench--part-url url) sign "GET" nil nil destination)
+           (message "Feishu Project attachment downloaded")))))))
 
 ;;;###autoload
 (defun feishu-project-advanced-node-subtask (node-id action &optional task-id)

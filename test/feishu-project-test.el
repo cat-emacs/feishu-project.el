@@ -6,6 +6,7 @@
 (require 'feishu-project-openapi)
 (require 'feishu-project-workbench)
 (require 'feishu-project-export)
+(require 'feishu-project-cli)
 
 ;; Load pure MCP parsers without starting or requiring mcp.el.
 (load (expand-file-name "../feishu-project-mcp.el"
@@ -703,6 +704,212 @@
     (should-not (alist-get 'optional (car (alist-get 'required payload))))
     (should-not (alist-get 'detail-truncated
                            (plist-get (feishu-project-mcp--detail-result detail-payload) :item)))))
+
+(ert-deftest feishu-project-test-cli-security-contracts-and-url-adaptation ()
+  (let ((process-environment '("PATH=/bin" "COOKIE=bad" "PRIVATE_KEY=bad"
+                               "DROP=bad" "LC_ALL=C"
+                               "HTTPS_PROXY=https://u:p@bad"
+                               "HTTP_PROXY=https://:secret@bad"))
+        (feishu-project-cli-environment '("LANG=C")))
+    (let ((environment (feishu-project-cli--safe-environment)))
+      (should (member "PATH=/bin" environment))
+      (should (member "LC_ALL=C" environment))
+      (should-not (seq-some (lambda (entry) (string-prefix-p "COOKIE=" entry)) environment))
+      (should-not (seq-some (lambda (entry) (string-prefix-p "DROP=" entry)) environment))
+      (should-not (seq-some (lambda (entry) (string-suffix-p "_PROXY=" entry))
+                            environment))
+      (should-not (seq-some (lambda (entry)
+                              (string-match-p "\\`HTTPS?_PROXY=" entry))
+                            environment))))
+  (dolist (name '("TOKEN=x" "PRIVATE_KEY=x" "COOKIE=x" "API_KEY=x"
+                  "PROXY=https://:secret@bad"))
+    (let ((feishu-project-cli-environment (list name)))
+      (should-error (feishu-project-cli--safe-environment) :type 'user-error)))
+  (dolist (text '("{}" "[]" "null")) (should-error (feishu-project-cli--envelope text)))
+  (should (equal (alist-get 'data (feishu-project-cli--envelope "{\"data\":null}")) nil))
+  (should (string-match-p "REDACTED" (feishu-project-cli--redact "token=abc https://x/y?sig=bad")))
+  (let ((feishu-project-host "https://project.feishu.cn"))
+    (should (equal (feishu-project-cli--project-url "https://project.feishu.cn/p/story/detail/7117416064" t)
+                   '(:project_key "p" :work_item_id "7117416064")))
+    (dolist (url '("http://project.feishu.cn/p" "https://evil.example/p"
+                   "https://user:password@project.feishu.cn/p"
+                   "https://:password@project.feishu.cn/p"
+                   "https://@project.feishu.cn/p"
+                   "https://project.feishu.cn/p/extra" "https://project.feishu.cn/p/story/detail/7/x"))
+      (should-error (feishu-project-cli--project-url url (string-match-p "detail" url)) :type 'user-error))))
+
+(ert-deftest feishu-project-test-cli-contract-filter-pagination-and-attachments ()
+  (let ((payload (feishu-project-cli--action-payload 'transition-required
+                                                      '(:project_key "p" :work_item_id "7" :state_key "done" :transition_id "bad" :drop "x"))))
+    (should (equal "p" (plist-get payload :project_key)))
+    (should (equal "7" (plist-get payload :work_item_id)))
+    (should (equal "done" (plist-get payload :state_key)))
+    (should-not (plist-member payload :transition_id))
+    (should-not (plist-member payload :drop)))
+  (should-error (feishu-project-cli--action-payload 'transition-required '(:transition_id "bad")) :type 'user-error)
+  (let* ((payload (feishu-project-cli--json "{\"list\":[{\"group_infos\":[{\"group_id\":\"g\"}],\"count\":100}],\"session_id\":\"s\",\"data\":{\"g\":[{\"moql_field_list\":[{\"key\":\"work_item_id\",\"value_type\":\"long_value\",\"value\":{\"long_value\":7117416064}}]}]}}"))
+         (result (feishu-project-cli--mql-result payload "p" '(:key "story" :name "Story") "SELECT" 4)))
+    (should (= 7117416064 (alist-get 'work_item_id (car (plist-get result :items)))))
+    (should (= 5 (plist-get (plist-get result :continuation) :fetched))))
+  (let (argv)
+    (cl-letf (((symbol-function 'feishu-project-cli--ensure-auth) (lambda (success _failure) (funcall success)))
+              ((symbol-function 'feishu-project-cli--process) (lambda (command success _failure) (setq argv command) (funcall success "{\"data\":null}"))))
+      (feishu-project-cli--file-action 'upload-file "/tmp/source" '(:project_key "p" :work_item_id "7" :mime_type "text/plain" :field_key "f") #'ignore #'ert-fail)
+      (should (equal (seq-take argv 4) '("meegle" "attachment" "+upload" "/tmp/source")))
+      (should-not (member "--params" argv)))))
+
+(ert-deftest feishu-project-test-cli-process-races-and-start-cleanup ()
+  (let (sentinel timeout status stdout stderr failures)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/bin/meegle"))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq sentinel (plist-get args :sentinel)
+                       stdout (plist-get args :buffer)
+                       stderr (plist-get args :stderr))
+                 'fake))
+              ((symbol-function 'run-at-time)
+               (lambda (_seconds _repeat callback) (setq timeout callback) 'timer))
+              ((symbol-function 'cancel-timer) #'ignore)
+              ((symbol-function 'process-live-p) (lambda (_) (eq status 'run)))
+              ((symbol-function 'process-status) (lambda (_) status))
+              ((symbol-function 'process-exit-status) (lambda (_) 1))
+              ((symbol-function 'kill-process)
+               (lambda (proc) (setq status 'signal) (funcall sentinel proc "killed"))))
+      (setq status 'run)
+      (feishu-project-cli--process '("meegle" "auth" "status") #'ert-fail
+                                   (lambda (error) (push error failures)))
+      (funcall timeout)
+      (funcall sentinel 'fake "again")
+      (should (equal failures '("Meegle CLI request timed out")))
+      (should-not (buffer-live-p stdout))
+      (should-not (buffer-live-p stderr))))
+  (let (stdout stderr failure)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/bin/meegle"))
+              ((symbol-function 'generate-new-buffer)
+               (lambda (name)
+                 (let ((buffer (get-buffer-create (generate-new-buffer-name name))))
+                   (if stdout (setq stderr buffer) (setq stdout buffer)) buffer)))
+              ((symbol-function 'make-process) (lambda (&rest _) (error "boom"))))
+      (feishu-project-cli--process '("meegle") #'ert-fail
+                                   (lambda (error) (setq failure error)))
+      (should failure)
+      (should-not (buffer-live-p stdout))
+      (should-not (buffer-live-p stderr)))))
+
+(ert-deftest feishu-project-test-cli-auth-cache-and-deferred-file-environment ()
+  (let ((feishu-project-cli--authenticated (make-hash-table :test #'equal)) calls)
+    (cl-letf (((symbol-function 'feishu-project-cli--process)
+               (lambda (argv success _failure)
+                 (push argv calls) (funcall success "{\"authenticated\":true}"))))
+      (let ((feishu-project-cli-profile nil))
+        (feishu-project-cli--ensure-auth #'ignore #'ert-fail)
+        (feishu-project-cli--ensure-auth #'ignore #'ert-fail))
+      (let ((feishu-project-cli-profile "other"))
+        (feishu-project-cli--ensure-auth #'ignore #'ert-fail))
+      (should (= 2 (length calls)))))
+  (let ((process-environment '("PATH=/bin" "COOKIE=drop"))
+        (feishu-project-cli-environment '("LANG=C"))
+        deferred seen)
+    (cl-letf (((symbol-function 'feishu-project-cli--ensure-auth)
+               (lambda (success _failure) (setq deferred success)))
+              ((symbol-function 'feishu-project-cli--process)
+               (lambda (_argv success _failure)
+                 (setq seen process-environment)
+                 (funcall success "{\"data\":null}"))))
+      (feishu-project-cli--file-action
+       'upload-file "/tmp/source"
+       '(:project_key "p" :work_item_id "7" :mime_type "text/plain")
+       #'ignore #'ert-fail)
+      (should-not seen)
+      (funcall deferred)
+      (should (member "MEEGLE_NO_UPDATE_CHECK=1" seen))
+      (should (member "PATH=/bin" seen))
+      (should-not (seq-some (lambda (entry) (string-prefix-p "COOKIE=" entry)) seen)))))
+
+(ert-deftest feishu-project-test-cli-list-selects-type-and-validates-filters ()
+  (let ((types (feishu-project-cli--json
+                "{\"list\":[{\"type_key\":\"story\",\"name\":\"Story\"}]}"))
+        (fields (feishu-project-cli--json
+                 "{\"list\":[{\"field_key\":\"work_item_status\"}]}"))
+        (page (feishu-project-cli--json
+               "{\"list\":[{\"group_infos\":[{\"group_id\":\"g\"}],\"count\":0}],\"data\":{\"g\":[]}}"))
+        calls result)
+    (with-temp-buffer
+      (feishu-project-list-mode)
+      (setq feishu-project--generation 1
+            feishu-project--filters '(:type "story" :status "doing"))
+      (let ((context (list :buffer (current-buffer) :generation 1
+                           :filters feishu-project--filters)))
+        (cl-letf (((symbol-function 'feishu-project-cli--call)
+                   (lambda (domain method payload success _failure)
+                     (push (list domain method payload) calls)
+                     (funcall success
+                              (pcase method
+                                ("meta-types" types)
+                                ("meta-fields" fields)
+                                ("query" page))))))
+          (feishu-project-cli--list
+           "p" nil nil nil context
+           (lambda (value) (setq result value)) #'ert-fail))))
+    (should result)
+    (setq calls (nreverse calls))
+    (should (equal (mapcar #'cadr calls)
+                   '("meta-types" "meta-fields" "query")))
+    (should (string-match-p "`work_item_status` = 'doing'"
+                            (plist-get (nth 2 (nth 2 calls)) :mql)))))
+
+(ert-deftest feishu-project-test-cli-mql-replay-and-pagination-state ()
+  (let ((response (feishu-project-cli--json
+                   "{\"list\":[{\"group_infos\":[{\"group_id\":\"g\"}],\"count\":5}],\"session_id\":\"s\",\"data\":{\"g\":[]}}"))
+        payload result)
+    (cl-letf (((symbol-function 'feishu-project-cli--call)
+               (lambda (_domain _method params success _failure)
+                 (setq payload params)
+                 (funcall success response))))
+      (feishu-project-cli--mql
+       "p" nil '(:kind replay :mql "SELECT" :type (:key "story" :name "Story"))
+       nil (lambda (value) (setq result value)) #'ert-fail))
+    (should (equal "SELECT" (plist-get payload :mql)))
+    (should (equal "SELECT"
+                   (plist-get (plist-get result :current-page-token) :mql))))
+  (let ((response (feishu-project-cli--json
+                   "{\"list\":[{\"group_infos\":[{\"group_id\":\"g\"}],\"count\":5}],\"session_id\":\"s\",\"data\":{\"g\":[{\"moql_field_list\":[]}]}}"))
+        result)
+    (cl-letf (((symbol-function 'feishu-project-cli--call)
+               (lambda (_domain _method _params success _failure)
+                 (funcall success response))))
+      (feishu-project-cli--mql
+       "p" nil '(:kind session :session-id "s" :group-id "g"
+                       :page-num 2 :fetched 2 :type (:key "story" :name "Story"))
+       nil (lambda (value) (setq result value)) #'ert-fail))
+    (let ((next (plist-get result :continuation)))
+      (should (= 3 (plist-get next :fetched)))
+      (should (= 3 (plist-get next :page-num))))))
+
+(ert-deftest feishu-project-test-cli-url-find-preserves-allowed-options ()
+  (let (payload)
+    (cl-letf (((symbol-function 'feishu-project-cli--call)
+               (lambda (_domain _method params _success _failure)
+                 (setq payload params))))
+      (let ((feishu-project-host "https://project.feishu.cn"))
+        (feishu-project-cli--action
+         'find '(:url "https://project.feishu.cn/p/story/detail/7"
+                      :fields ["_all"] :page_size 100 :drop "x")
+         #'ignore #'ert-fail)))
+    (should (equal "p" (plist-get payload :project_key)))
+    (should (equal "7" (plist-get payload :work_item_id)))
+    (should (equal ["_all"] (plist-get payload :fields)))
+    (should (= 100 (plist-get payload :page_size)))
+    (should-not (plist-member payload :drop))))
+
+(ert-deftest feishu-project-test-cli-detail-normalizes-common-fields ()
+  (let* ((payload
+          (feishu-project-cli--json
+           "{\"work_item_attribute\":{\"owned_project\":{\"key\":\"p\",\"simple_name\":\"simple\"},\"work_item_id\":\"7\",\"work_item_name\":\"Name\",\"work_item_type\":{\"key\":\"story\",\"name\":\"Story\"},\"work_item_status\":{\"name\":\"OPEN\"},\"create_time\":\"created\",\"update_time\":\"updated\"},\"work_item_fields\":[],\"pagination\":{\"has_more\":false}}"))
+         (item (plist-get (feishu-project-cli--detail-result payload) :item)))
+    (should (equal "OPEN" (alist-get 'name (alist-get 'work_item_status item))))
+    (should (equal "created" (alist-get 'created_at item)))
+    (should (equal "updated" (alist-get 'updated_at item)))))
 
 (provide 'feishu-project-test)
 ;;; feishu-project-test.el ends here

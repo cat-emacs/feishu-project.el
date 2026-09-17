@@ -1,11 +1,10 @@
 # feishu-project.el
 
 Browse [Feishu Project](https://project.feishu.cn/) work items from Emacs.
-`feishu-project.el` has two interchangeable read backends: the original
-plugin-token OpenAPI backend and an optional user-OAuth MCP backend.  MCP also
-provides the explicitly confirmed workbench write actions documented below. The
-default is `openapi`, so upgrading does not start Node, open a browser, or
-change existing credentials.
+`feishu-project.el` has three interchangeable backends: the original plugin-token
+OpenAPI backend, an optional native MCP backend, and an optional official Meegle
+CLI backend. The default is `openapi`, so upgrading does not start a process,
+open a browser, or change existing credentials.
 
 ## Installation
 
@@ -74,16 +73,33 @@ fields; if the server says more field pages exist, the detail buffer explicitly
 marks the result truncated rather than claiming completeness.  Arbitrary MQL
 may omit a type key, in which case browser/detail URLs are unavailable.
 
+## Official Meegle CLI backend
+
+The optional `cli` backend supports Emacs 29.1+ through the official Meegle CLI
+**v1.0.23**. Install and authenticate `meegle` yourself; this package never
+installs it, starts login, reads its credentials, or passes credentials in argv.
+
+```elisp
+(setq feishu-project-backend 'cli)
+(setq feishu-project-cli-executable "meegle")
+```
+
+The adapter uses asynchronous argv-only `make-process` calls with
+`--format json --envelope`. Its child environment is a small cross-platform
+allowlist plus validated custom entries, always sets `MEEGLE_NO_UPDATE_CHECK=1`,
+and redacts token-like values and HTTP(S) URLs from errors. CLI attachment
+commands use official `attachment +upload` / `attachment +download` shortcuts.
+
 ## Workbench commands
 
-With the MCP backend, the common callback-first UI also provides project aliases,
+With the MCP or CLI backend, the common callback-first UI also provides project aliases,
 query history and saved descriptors, schema-aware filters, selectable columns,
 marks, CSV/TSV/Org/Markdown/JSON export, and stale-safe detail sections.
 `M-x feishu-project-find`, `feishu-project-detail-refresh`,
 `feishu-project-show-comments`, `feishu-project-show-related`, and
 `feishu-project-show-history` work from their respective list/detail contexts.
 
-List filters are MCP-only. After selecting a type by key or display name, the
+List filters are available through MCP and CLI. After selecting a type by key or display name, the
 backend validates the exact status (`work_item_status`), assignee, and creator
 field keys through that type's field configuration before it emits escaped MQL
 predicates. OpenAPI rejects filters explicitly rather than silently ignoring
@@ -91,7 +107,7 @@ them. `?` opens optional lazy-loaded transient list/detail/batch menus when
 `transient` is installed; every action remains available through `M-x` without
 it.
 
-Writes are MCP-only and always require explicit confirmation. Field edits,
+Writes are MCP- or CLI-backed and always require explicit confirmation. Field edits,
 state transitions, comments, batch edits, and creates validate the current
 server schema first. A state transition queries allowed transitions and required
 fields before confirmation; required fields stop the transition instead of being
@@ -99,13 +115,14 @@ silently guessed. Batch edits snapshot marks, validate each project/type once,
 confirm only after all schemas pass, and report final success/failure IDs.
 Create validates enabled template `option_id` values and uses aggregate
 `FieldConfList` metadata to reject missing required fields. Comment deletion is
-not exposed because the MCP contract does not verify it.
+not exposed because no verified backend contract supports it.
 
-Attachments support only direct single-part transfers. Upload metadata uses
+Attachments use direct single-part transfers on native MCP. Upload metadata uses
 attachment resource type `15`; download takes the MCP-provided `file_url`.
-Multipart metadata is rejected. The temporary signed URL, file token, and
-`X-Meego-File-Sign` header are used only for the transfer and are never shown,
-logged, or persisted.
+Multipart MCP metadata is rejected. The CLI backend instead delegates end-to-end
+multipart upload/download to its official attachment shortcuts. Temporary signed
+URLs, file tokens, and `X-Meego-File-Sign` values are never shown, logged, or
+persisted.
 
 ## Commands and keys
 

@@ -45,7 +45,8 @@
 (defcustom feishu-project-backend 'openapi
   "Backend used for Feishu Project requests."
   :type '(choice (const :tag "OpenAPI" openapi)
-                 (const :tag "MCP" mcp)))
+                 (const :tag "MCP" mcp)
+                 (const :tag "Official Meegle CLI (v1.0.23)" cli)))
 
 (defcustom feishu-project-page-size 100
   "Preferred number of rows requested by a backend."
@@ -109,6 +110,7 @@ with the originating list buffer and generation.  Results contain :items or
       (pcase name
         ('openapi (require 'feishu-project-openapi))
         ('mcp (require 'feishu-project-mcp))
+        ('cli (require 'feishu-project-cli))
         (_ (user-error "Unknown Feishu Project backend: %S" name))))
     (or (gethash name feishu-project--backends)
         (error "Feishu Project backend %S did not register" name))))
@@ -125,9 +127,12 @@ with the originating list buffer and generation.  Results contain :items or
          (function (plist-get (feishu-project--backend backend) :action)))
     (if function
         (funcall function action payload success failure)
-      (funcall failure (format "Feishu Project backend %s does not support %s; select MCP"
+      (funcall failure (format "Feishu Project backend %s does not support %s; select an action-capable backend"
                                backend action)))))
 
+(defun feishu-project--backend-capable-p (capability &optional backend)
+  "Return non-nil when BACKEND declares CAPABILITY."
+  (memq capability (plist-get (feishu-project--backend backend) :capabilities)))
 
 (defun feishu-project--get (key object)
   "Return KEY from plist or alist OBJECT, accepting symbol or string keys."
@@ -507,7 +512,7 @@ Page state is committed only by a successful callback."
      (when (eq feishu-project-backend 'openapi)
        (require 'feishu-project-openapi))
      (list (feishu-project--read-project-key)
-           (unless (eq feishu-project-backend 'mcp)
+           (unless (memq feishu-project-backend '(mcp cli))
              (or (feishu-project--read-type-keys)
                  (user-error "At least one work item type key is required")))
            (let ((value (read-string "Name contains (empty for all): ")))

@@ -1,7 +1,7 @@
 EMACS ?= emacs
 BATCH = $(EMACS) -Q --batch
 SOURCES = feishu-project.el feishu-project-openapi.el feishu-project-mcp.el \
-	feishu-project-workbench.el feishu-project-export.el
+	feishu-project-cli.el feishu-project-workbench.el feishu-project-export.el
 
 .PHONY: all compile test clean
 
