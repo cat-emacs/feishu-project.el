@@ -911,5 +911,20 @@
     (should (equal "created" (alist-get 'created_at item)))
     (should (equal "updated" (alist-get 'updated_at item)))))
 
+(ert-deftest feishu-project-test-updated-column-shows-full-iso-time ()
+  (let* ((timestamp "2026-09-18T17:15:27+08:00")
+         (item (copy-tree feishu-project-test--item)))
+    (setf (alist-get 'updated_at item) timestamp)
+    (with-temp-buffer
+      (feishu-project-list-mode)
+      (setq feishu-project--items (list item)
+            tabulated-list-entries (list (feishu-project--entry item)))
+      (tabulated-list-print t)
+      (should (string-match-p (regexp-quote timestamp) (buffer-string)))
+      (let ((updated (seq-find (lambda (column)
+                                 (equal (nth 0 column) "Updated"))
+                               tabulated-list-format)))
+        (should (>= (nth 1 updated) (string-width timestamp)))))))
+
 (provide 'feishu-project-test)
 ;;; feishu-project-test.el ends here

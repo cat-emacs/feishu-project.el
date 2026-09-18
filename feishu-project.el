@@ -84,7 +84,7 @@
   '(("ID" 13 feishu-project--item-id)
     ("Type" 12 feishu-project--item-type)
     ("Status" 18 feishu-project--item-status)
-    ("Updated" 17 feishu-project--item-updated)
+    ("Updated" 25 feishu-project--item-updated)
     ("Name" 60 feishu-project--item-name))
   "Columns displayed by `feishu-project-list-mode'."
   :type '(repeat (list string integer function)))
